@@ -1,0 +1,44 @@
+name: Test and build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test
+        run: go test -mod=readonly -race ./...
+      - name: Build shared library
+        env:
+          CGO_ENABLED: '1'
+        run: |
+          mkdir -p dist
+          go build -mod=readonly -trimpath -buildmode=c-shared -o dist/workbuddy.so .
+          cd dist
+          sha256sum workbuddy.so workbuddy.h > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: workbuddy-linux-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
