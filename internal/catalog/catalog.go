@@ -1,4 +1,4 @@
-// Package catalog discovers account-scoped CodeBuddy models and public metadata.
+// Package catalog discovers account-scoped WorkBuddy models and public metadata.
 package catalog
 
 import (
@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-const ConfigURL = "https://copilot.tencent.com/v3/config"
+const ConfigURL = "https://www.workbuddy.cn/v3/config"
 
 type Credentials struct{ AccessToken, UID, EnterpriseID, Domain string }
 type Options struct {
@@ -162,10 +162,11 @@ func HTTPFetcher(client *http.Client, endpoint, userAgent string) Fetcher {
 		req.Header.Set("Authorization", "Bearer "+c.AccessToken)
 		req.Header.Set("X-User-Id", c.UID)
 		req.Header.Set("X-Product", "SaaS")
+		req.Header.Set("X-Product-Code", "workbuddy")
 		req.Header.Set("User-Agent", userAgent)
 		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Origin", "https://www.codebuddy.cn")
-		req.Header.Set("Referer", "https://www.codebuddy.cn/")
+		req.Header.Set("Origin", "https://www.workbuddy.cn")
+		req.Header.Set("Referer", "https://www.workbuddy.cn/")
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
 		if c.EnterpriseID != "" {
 			req.Header.Set("X-Enterprise-Id", c.EnterpriseID)

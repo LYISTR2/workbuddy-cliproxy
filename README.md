@@ -1,26 +1,28 @@
 # workbuddy-cliproxy
 
-本 fork 的 **v0.3.0** 使用账号的实时模型目录，适配 CPA v8.0.56。更新说明见 [CHANGELOG](CHANGELOG.md)。模型由上游返回，后续新增模型无需逐个修改源码；模型重新注册的刷新方式见 [动态模型目录](docs/dynamic-models.md#定期刷新)。
+本 fork 的 **v0.3.1** 使用 WorkBuddy 国内版官方网页授权（`platform=workbuddy`）和账号的实时模型目录，适配 CPA v8.0.56。更新说明见 [CHANGELOG](CHANGELOG.md)。模型由上游返回，后续新增模型无需逐个修改源码；模型重新注册的刷新方式见 [动态模型目录](docs/dynamic-models.md#定期刷新)。
 
-把**腾讯 CodeBuddy**（`copilot.tencent.com`）封装成 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)(CPA)插件,任何支持 OpenAI / Anthropic 协议的客户端(Claude Code、Cursor、Cline、SDK……)都能直接调用 CodeBuddy 背后的模型。
+把**腾讯 WorkBuddy 国内版**（`www.workbuddy.cn`）封装成 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)(CPA)插件,任何支持 OpenAI / Anthropic 协议的客户端(Claude Code、Cursor、Cline、SDK……)都能直接调用 WorkBuddy 背后的模型。
 
 对 [Sliverkiss/cpa-plugin](https://github.com/Sliverkiss/cpa-plugin) 公开 `workbuddy.so` 的 clean-room 逆向重写,补齐了源码与 x86_64 支持;workbuddy 的原始设计归属 Sliverkiss。
 
 ## 工作原理
 
-在 CPA 里注册为 `workbuddy` provider:负责 CodeBuddy 扫码登录、token 刷新,并把请求转发到 `copilot.tencent.com/v2/chat/completions`。登录后凭据存为 `workbuddy.json`。
+在 CPA 里注册为 `workbuddy` provider：通过 `https://www.workbuddy.cn/v2/plugin/auth/state?platform=workbuddy` 获取官方授权链接，打开 WorkBuddy 登录网页，轮询 token，再通过 `/v2/plugin/account` 读取账号资料；聊天请求转发到 `www.workbuddy.cn/v2/chat/completions`。
+
+升级后请在 CPA 中重新添加一次 WorkBuddy 授权，并停用不再使用的旧入口凭据。现有凭据不会自动改写，`workbuddy` provider 名和账号文件格式保持兼容。
 
 ## 模型
 
-登录后，插件使用当前账号请求 CodeBuddy `GET /v3/config`，按 `agents.cli.models` 动态注册模型，不再维护固定列表。通过 `catalog.channel` 可以选择其他上游公布的渠道；渠道缺失时不会回退到整个产品模型池。
+登录后，插件使用当前账号请求 WorkBuddy `GET /v3/config`，按 `agents.cli.models` 动态注册模型，不再维护固定列表。目录渠道 `cli` 与登录平台是两个参数；登录平台固定为 `workbuddy`。通过 `catalog.channel` 可以选择其他上游公布的渠道；渠道缺失时不会回退到整个产品模型池。
 
-模型 ID、默认思考档位和积分倍率来自该账号、渠道的配置，可能与 CodeBuddy 桌面客户端不同。目录列出模型不代表已经验证推理可用性，实际调用仍受账号权限和额度约束。旧 ID 如果已不在上游目录中，将不再注册；客户端需要刷新模型列表，不会自动重写成另一模型。
+模型 ID、默认思考档位和积分倍率来自该账号、渠道的配置，可能与 WorkBuddy 桌面客户端不同。目录列出模型不代表已经验证推理可用性，实际调用仍受账号权限和额度约束。旧 ID 如果已不在上游目录中，将不再注册；客户端需要刷新模型列表，不会自动重写成另一模型。
 
 标准 `GET /v1/models` 保留 `id`、`object`、`owned_by`，并补充上游公布的显示名称、思考档位、积分倍率和目录更新时间。字段与缓存行为见 [动态模型目录](docs/dynamic-models.md)。
 
 ## 安装
 
-**前置**:带 CGO / 动态插件支持的 CLIProxyAPI、CodeBuddy 账号、Go 1.26+ 与 gcc；编译系统与架构需与 CPA 实例一致。本版本在 Linux amd64、CPA v8.0.56 上验证加载和注册。CPA 的 `no-plugin` 构建无法使用此插件。
+**前置**:带 CGO / 动态插件支持的 CLIProxyAPI、WorkBuddy 账号、Go 1.26+ 与 gcc；编译系统与架构需与 CPA 实例一致。本版本在 Linux amd64、CPA v8.0.56 上验证加载和注册。CPA 的 `no-plugin` 构建无法使用此插件。
 
 在本仓库的 [Actions](https://github.com/LYISTR2/workbuddy-cliproxy/actions) 中下载成功构建的 `workbuddy-linux-amd64` 或 `workbuddy-linux-arm64` 产物，解压得到 `workbuddy.so`。amd64 构建使用 Ubuntu 22.04，arm64 使用 Ubuntu 24.04；较旧发行版或其他系统请在目标环境编译。
 
@@ -49,7 +51,7 @@ plugins:
         max-stale-seconds: 86400
 ```
 
-重启 CPA,日志出现 `plugin loaded ... plugin_id=workbuddy` 即成功。然后到 CPA 面板添加 workbuddy 凭据,扫码登录 CodeBuddy；`GET /v1/models` 将显示该账号当前渠道的模型。未登录时不发布静态模型。
+重启 CPA,日志出现 `plugin loaded ... plugin_id=workbuddy` 即成功。然后到 CPA 面板添加 workbuddy 凭据,扫码登录 WorkBuddy；`GET /v1/models` 将显示该账号当前渠道的模型。未登录时不发布静态模型。
 
 ## 使用
 
@@ -82,11 +84,11 @@ curl http://localhost:8317/v1/chat/completions \
   -d '{"model":"<model-id>","messages":[{"role":"user","content":"你好"}],"stream":true}'
 ```
 
-流式 / 非流式都支持;非流式请求会被内部转成流式再聚合(CodeBuddy 上游 `code 11101` 拒绝非流式)。
+流式 / 非流式都支持;非流式请求会被内部转成流式再聚合(WorkBuddy 上游 `code 11101` 拒绝非流式)。
 
 ## Claude Code 兼容性
 
-腾讯 CodeBuddy 的内容审核把 Claude Code 的两句固定 system 模板逐字加进了黑名单,命中即回"敏感内容"拒答:
+腾讯 WorkBuddy 的内容审核把 Claude Code 的两句固定 system 模板逐字加进了黑名单,命中即回"敏感内容"拒答:
 
 - `You are Claude Code, Anthropic's official CLI for Claude.`(身份句)
 - `Main branch (you will usually use this for PRs)`(git 注入句)
@@ -109,7 +111,7 @@ curl http://localhost:8317/v1/chat/completions \
 
 Linux 下运行 `sh scripts/build-linux.sh`，脚本会执行 `go test -race ./...` 并构建共享库；可用 `GO_BIN` 指定 Go 编译器。Windows 可运行纯 Go 模块测试 `go test ./internal/catalog`。
 
-测试使用模拟账号和目录，未使用你的 CodeBuddy 凭据。实际模型可用性、额度和计费需登录后确认。
+测试使用模拟账号和目录，未使用你的 WorkBuddy 凭据。实际模型可用性、额度和计费需登录后确认。
 
 目录按需缓存 5 分钟。要定期更新 CPA 的模型注册，可选用 `scripts/refresh_models.py` 和 `deploy/` 中的 systemd 模板；它们通过管理 API 触发配置热重载，不重启 CPA。安装步骤、凭据格式和限制见 [定期刷新](docs/dynamic-models.md#定期刷新)。
 

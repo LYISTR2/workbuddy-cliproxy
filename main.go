@@ -1,6 +1,6 @@
 // Package main implements the workbuddy CLIProxyAPI dynamic plugin.
 //
-// workbuddy wraps Tencent CodeBuddy (copilot.tencent.com) as a cliproxy
+// workbuddy wraps Tencent WorkBuddy China (www.workbuddy.cn) as a cliproxy
 // provider: it performs the CodeBuddy web login flow, refreshes access
 // tokens, and forwards OpenAI-compatible chat completion requests to the
 // upstream /v2/chat/completions endpoint.
@@ -60,12 +60,14 @@ import "C"
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -78,12 +80,12 @@ import (
 const (
 	providerName  = "workbuddy"
 	authFileName  = "workbuddy.json"
-	upstreamBase  = "https://copilot.tencent.com"
-	clientUA      = "CLI/2.180.0 CodeBuddy/2.180.0"
-	originReferer = "https://www.codebuddy.cn"
+	upstreamBase  = "https://www.workbuddy.cn"
+	clientUA      = "WorkBuddy/CLIProxyAPI"
+	originReferer = upstreamBase
 
-	endpointAuthState    = upstreamBase + "/v2/plugin/auth/state?platform=CLI"
-	endpointLoginAcct    = upstreamBase + "/v2/plugin/login/account?state="
+	endpointAuthState    = upstreamBase + "/v2/plugin/auth/state?platform=workbuddy"
+	endpointAccount      = upstreamBase + "/v2/plugin/account"
 	endpointAuthToken    = upstreamBase + "/v2/plugin/auth/token?state="
 	endpointTokenRefresh = upstreamBase + "/v2/plugin/auth/token/refresh"
 	endpointChat         = upstreamBase + "/v2/chat/completions"
@@ -95,8 +97,11 @@ const (
 // CodeBuddy associates the browser login with the state issued at auth/state,
 // so we must reuse the same cookie jar across the state request and the polls.
 type loginCtx struct {
-	client  *http.Client
-	expires time.Time
+	mu             sync.Mutex
+	client         *http.Client
+	expires        time.Time
+	token          *tokenData // auth/token is one-shot; retain it while account data is pending.
+	tokenExpiresAt int64
 }
 
 var (
@@ -310,7 +315,7 @@ func wbRegistration() registration {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             providerName,
-			Version:          "0.3.0",
+			Version:          "0.3.1",
 			Author:           "lovingfish (clean-room rebuild; original workbuddy by Sliverkiss)",
 			GitHubRepository: "https://github.com/LYISTR2/workbuddy-cliproxy",
 		},
@@ -399,6 +404,7 @@ func sharedHTTPClient() *http.Client {
 		sharedClient = &http.Client{
 			Timeout: 120 * time.Second,
 			Transport: &http.Transport{
+				Proxy:               http.ProxyFromEnvironment,
 				MaxIdleConns:        20,
 				IdleConnTimeout:     90 * time.Second,
 				MaxIdleConnsPerHost: 5,
@@ -427,6 +433,8 @@ func commonHeaders(req *http.Request) {
 	req.Header.Set("Origin", originReferer)
 	req.Header.Set("Referer", originReferer+"/")
 	req.Header.Set("User-Agent", clientUA)
+	req.Header.Set("X-Product", "SaaS")
+	req.Header.Set("X-Product-Code", providerName)
 }
 
 // backendHeaders applies auth-derived headers to a chat completion request.
@@ -533,13 +541,39 @@ func handleStartLogin(raw []byte) ([]byte, error) {
 	if st.State == "" || st.AuthURL == "" {
 		return nil, fmt.Errorf("auth state: missing state or authUrl")
 	}
+	loginURL, err := workbuddyLoginURL(st.AuthURL, st.State)
+	if err != nil {
+		return nil, err
+	}
 	loginStates.Store(st.State, &loginCtx{client: client, expires: time.Now().Add(loginTTL)})
 	return okEnvelope(pluginapi.AuthLoginStartResponse{
 		Provider:  providerName,
-		URL:       st.AuthURL,
+		URL:       loginURL,
 		State:     st.State,
 		ExpiresAt: time.Now().Add(loginTTL).UTC(),
 	})
+}
+
+func workbuddyLoginURL(raw, state string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.User != nil || (u.Host != "www.workbuddy.cn" && u.Host != "workbuddy.cn") {
+		return "", fmt.Errorf("auth state: expected the official WorkBuddy login URL")
+	}
+	query := u.Query()
+	if query.Get("platform") != "workbuddy" || query.Get("state") != state {
+		return "", fmt.Errorf("auth state: unexpected WorkBuddy authorization parameters")
+	}
+	if query.Get("loginSessionId") == "" {
+		var id [16]byte
+		if _, err := rand.Read(id[:]); err != nil {
+			return "", fmt.Errorf("create WorkBuddy login session: %w", err)
+		}
+		id[6] = (id[6] & 0x0f) | 0x40
+		id[8] = (id[8] & 0x3f) | 0x80
+		query.Set("loginSessionId", fmt.Sprintf("%x-%x-%x-%x-%x", id[:4], id[4:6], id[6:8], id[8:10], id[10:]))
+	}
+	u.RawQuery = query.Encode()
+	return u.String(), nil
 }
 
 func handlePollLogin(raw []byte) ([]byte, error) {
@@ -556,59 +590,55 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 		return nil, fmt.Errorf("poll: unknown state (restart login)")
 	}
 	lc := v.(*loginCtx)
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
 	if time.Now().After(lc.expires) {
 		loginStates.Delete(state)
 		return nil, fmt.Errorf("poll: login expired")
 	}
 
-	// Single-shot poll per RPC: the host drives the polling cadence.
-	// auth/token is the authoritative login-status endpoint: the application
-	// layer returns code 11217 ("login ing") while pending, and code 0 with the
-	// token bundle once complete. login/account sits behind the openresty gateway
-	// and is rejected (401) until login finishes, so probe token first and only
-	// fetch account once we hold a bearer.
-	tokRaw, _, errTok := doJSON(lc.client, http.MethodGet, endpointAuthToken+state, nil, nil)
-	if errTok != nil {
-		return okEnvelope(pluginapi.AuthLoginPollResponse{
-			Status:  pluginapi.AuthLoginStatusPending,
-			Message: "waiting for login",
-		})
+	// The host drives polling. Once issued, a token must survive account-service
+	// delays: asking auth/token for it a second time may never return it again.
+	if lc.token == nil {
+		tokRaw, _, errTok := doJSON(lc.client, http.MethodGet, endpointAuthToken+url.QueryEscape(state), nil, nil)
+		var tok tokenData
+		if errTok != nil || json.Unmarshal(tokRaw, &tok) != nil || tok.AccessToken == "" {
+			return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending, Message: "waiting for WorkBuddy login"})
+		}
+		lc.token = &tok
+		lc.tokenExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
 	}
-	var tok tokenData
-	if err := json.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
-		return okEnvelope(pluginapi.AuthLoginPollResponse{
-			Status:  pluginapi.AuthLoginStatusPending,
-			Message: "waiting for login",
-		})
-	}
-
-	var acct accountData
-	acctHeaders := func(r *http.Request) {
-		commonHeaders(r)
-		r.Header.Set("Authorization", "Bearer "+tok.AccessToken)
-	}
-	if acctRaw, _, errAcct := doJSON(lc.client, http.MethodGet, endpointLoginAcct+state, acctHeaders, nil); errAcct == nil {
-		_ = json.Unmarshal(acctRaw, &acct)
-	}
-
+	tok := lc.token
 	sa := &storedAuth{
 		Auth: storedTokens{
 			AccessToken:  tok.AccessToken,
 			RefreshToken: tok.RefreshToken,
-			ExpiresAt:    time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix(),
+			ExpiresAt:    lc.tokenExpiresAt,
 			Domain:       tok.Domain,
 		},
-		Account: storedAccount{
-			UID:          acct.UID,
-			EnterpriseID: acct.EnterpriseID,
-			Nickname:     acct.Nickname,
-		},
 	}
+	account, err := fetchWorkbuddyAccount(lc.client, sa)
+	if err != nil {
+		return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending, Message: "waiting for WorkBuddy account details"})
+	}
+	sa.Account = account
 	loginStates.Delete(state)
 	return okEnvelope(pluginapi.AuthLoginPollResponse{
 		Status: pluginapi.AuthLoginStatusSuccess,
 		Auth:   toAuthData(sa),
 	})
+}
+
+func fetchWorkbuddyAccount(client *http.Client, sa *storedAuth) (storedAccount, error) {
+	raw, _, err := doJSON(client, http.MethodGet, endpointAccount, func(r *http.Request) { backendHeaders(r, sa) }, nil)
+	if err != nil {
+		return storedAccount{}, err
+	}
+	var account storedAccount
+	if err := json.Unmarshal(raw, &account); err != nil || strings.TrimSpace(account.UID) == "" {
+		return storedAccount{}, fmt.Errorf("WorkBuddy account response has no user ID")
+	}
+	return account, nil
 }
 
 func handleRefreshAuth(raw []byte) ([]byte, error) {
@@ -626,9 +656,9 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 		if sa.Account.EnterpriseID != "" {
 			r.Header.Set("X-Enterprise-Id", sa.Account.EnterpriseID)
 		}
-		r.Header.Set("X-Auth-Refresh-Source", providerName)
+		r.Header.Set("X-Auth-Refresh-Source", "plugin")
 	}
-	data, status, err := doJSON(sharedHTTPClient(), http.MethodPost, endpointTokenRefresh, headers, nil)
+	data, status, err := doJSON(sharedHTTPClient(), http.MethodPost, endpointTokenRefresh, headers, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		if status >= 400 {
 			return nil, fmt.Errorf("refresh rejected (HTTP %d)", status)
@@ -647,6 +677,10 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 		sa.Auth.Domain = tok.Domain
 	}
 	sa.Auth.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
+	// A temporary profile error must not discard newly rotated refresh tokens.
+	if account, err := fetchWorkbuddyAccount(sharedHTTPClient(), sa); err == nil {
+		sa.Account = account
+	}
 	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthData(sa)})
 }
 

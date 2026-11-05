@@ -176,7 +176,7 @@ func TestManagerDeduplicatesConcurrentDiscovery(t *testing.T) {
 }
 func TestHTTPFetcherUsesCurrentAccountHeaders(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "GET" || r.Header.Get("Authorization") != "Bearer test-token" || r.Header.Get("X-User-Id") != "test-user" || r.Header.Get("X-Enterprise-Id") != "test-enterprise" || r.Header.Get("X-Product") != "SaaS" {
+		if r.Method != "GET" || r.Header.Get("Authorization") != "Bearer test-token" || r.Header.Get("X-User-Id") != "test-user" || r.Header.Get("X-Enterprise-Id") != "test-enterprise" || r.Header.Get("X-Product") != "SaaS" || r.Header.Get("X-Product-Code") != "workbuddy" || r.Header.Get("Origin") != "https://www.workbuddy.cn" {
 			t.Error("account or channel headers missing")
 		}
 		_, _ = w.Write([]byte(fixture))

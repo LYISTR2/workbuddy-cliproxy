@@ -1,5 +1,16 @@
 # 更新记录
 
+## 0.3.1 — 2026-11-06
+
+- 默认授权服务改为 WorkBuddy 国内站 `www.workbuddy.cn`，使用 `platform=workbuddy`，直接打开官方返回的 WorkBuddy 网页；不再使用 CodeBuddy CLI 登录入口。
+- 同步切换模型目录、聊天、令牌轮询和刷新服务到 WorkBuddy 国内站，使用 WorkBuddy 产品请求头。
+- 通过 `/v2/plugin/account` 读取登录账号，确认有效 UID 后再保存凭据；保留一次性 token 以便账号资料暂未就绪时继续轮询。
+- 刷新使用 JSON `{}` 正文和 `X-Auth-Refresh-Source: plugin`，刷新后尽力更新账号资料，资料接口临时失败时保留已轮换的令牌。
+- 为官方授权 URL 添加独立 `loginSessionId`，校验 WorkBuddy 域名、平台和 state；补充登录、账号等待和刷新回归测试。HTTP 客户端遵循环境代理配置。
+- 升级后需在 CPA 中重新进行 WorkBuddy 授权。真实扫码登录和账号模型推理仍需用户登录后确认。
+
+验证：25 项测试（含竞态检查）、Linux amd64 共享库编译和 CPA v8.0.56 加载通过；通过已编译插件调用真实授权服务，确认返回 `https://www.workbuddy.cn/login`、`platform=workbuddy` 和独立登录会话。没有执行用户扫码登录。
+
 ## 0.3.0 — 2026-11-06
 
 - 采用账号、企业、域、渠道及令牌隔离的动态模型目录，替代固定的十个模型；目录来自 CodeBuddy `/v3/config`，默认只注册 CLI 渠道允许的模型。

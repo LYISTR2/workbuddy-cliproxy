@@ -1,7 +1,7 @@
 # 动态模型目录
 
 插件使用已登录账号的 access token、用户、企业和域信息请求
-`https://copilot.tencent.com/v3/config`，再按 `agents` 中所选渠道的模型 ID 筛选。
+`https://www.workbuddy.cn/v3/config`，再按 `agents` 中所选渠道的模型 ID 筛选。
 默认渠道为 `cli`，请求头沿用插件现有的 CLI 身份。
 
 只发布渠道允许且未被禁用的模型。渠道缺失、鉴权失败或无法获得可靠目录时，
@@ -45,7 +45,7 @@
   "catalog": {
     "provider": "workbuddy",
     "channel": "cli",
-    "source": "https://copilot.tencent.com/v3/config",
+    "source": "https://www.workbuddy.cn/v3/config",
     "fetched_at": "2026-09-22T00:00:00Z",
     "stale": false,
     "availability": "listed_by_upstream"
@@ -96,7 +96,7 @@ TTL 控制插件的按需发现缓存。CPA 的模型注册还需要宿主触发
 `/v1/models` 的拉取时间是否更新，不重启 CPA，也不修改账号令牌。
 
 当前脚本面向单账号目录，要求已经登录、存在可用模型且插件版本为
-`0.2.0-catalog` 或本 fork 的 `0.3.0`。多账号 `catalog_variants` 的刷新验证尚未支持。
+`0.2.0-catalog`、`0.3.0` 或本 fork 的 `0.3.1`。多账号 `catalog_variants` 的刷新验证尚未支持。
 Python 3 标准库即可运行：
 
 ```bash
