@@ -44,9 +44,9 @@ func TestPreparePayloadPreservesLowAndNativeModel(t *testing.T) {
 		t.Fatal("unlisted model was routed")
 	}
 }
-func TestPrepareRejectsUnsupportedEffort(t *testing.T) {
+func TestPrepareRejectsUnknownEffort(t *testing.T) {
 	setupRuntimeCatalog(t)
-	req := pluginapi.ExecutorRequest{AuthID: "test", Model: "hy3", Payload: []byte(`{"reasoning_effort":"max"}`)}
+	req := pluginapi.ExecutorRequest{AuthID: "test", Model: "hy3", Payload: []byte(`{"reasoning_effort":"invalid-effort"}`)}
 	_, err := prepareUpstreamPayload(req, testAuth())
 	requestErr, ok := err.(*requestError)
 	if !ok || requestErr.StatusCode() != 400 {

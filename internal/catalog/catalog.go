@@ -405,6 +405,16 @@ func (m Model) DefaultEffort() string {
 	return effort
 }
 func (m Model) ApplyReasoning(body map[string]any) error {
+	return m.ApplyReasoningWithPolicy(body, ReasoningCompatible)
+}
+
+func (m Model) ApplyReasoningWithPolicy(body map[string]any, policy ReasoningPolicy) error {
+	if policy == "" {
+		policy = ReasoningCompatible
+	}
+	if !policy.Valid() {
+		return fmt.Errorf("invalid reasoning effort policy %q", policy)
+	}
 	value, present := body["reasoning_effort"]
 	if !present {
 		if reasoning, ok := body["reasoning"].(map[string]any); ok {
@@ -431,20 +441,26 @@ func (m Model) ApplyReasoning(body map[string]any) error {
 			return fmt.Errorf("model %s does not allow disabling thinking", m.ID)
 		}
 	} else if levels := m.SupportedEfforts(); len(levels) > 0 {
-		valid := false
-		for _, level := range levels {
-			if effort == level {
-				valid = true
+		if !supportsEffort(levels, effort) {
+			target, compatible := compatibleEffort(effort, levels)
+			if policy == ReasoningStrict || !compatible {
+				return fmt.Errorf("reasoning_effort %q is not advertised for model %s (supported: %s; omit the field to use the model default)", effort, m.ID, strings.Join(levels, ", "))
 			}
-		}
-		if !valid {
-			return fmt.Errorf("reasoning_effort %q is not advertised for model %s", effort, m.ID)
+			effort = target
 		}
 	}
 	body["reasoning_effort"] = effort
+	// Do not send the original, conflicting Responses-style effort alongside
+	// the normalized Chat Completions field. Preserve other reasoning settings.
+	if reasoning, ok := body["reasoning"].(map[string]any); ok {
+		delete(reasoning, "effort")
+		if len(reasoning) == 0 {
+			delete(body, "reasoning")
+		}
+	}
 	return nil
 }
-func (s Snapshot) PublicFields(model Model, now time.Time) map[string]any {
+func (s Snapshot) PublicFields(model Model, now time.Time, policies ...ReasoningPolicy) map[string]any {
 	fields := map[string]any{
 		"name": model.Name, "display_name": model.Name,
 		"catalog": map[string]any{"provider": "workbuddy", "channel": s.Channel, "source": ConfigURL,
@@ -462,6 +478,16 @@ func (s Snapshot) PublicFields(model Model, now time.Time) map[string]any {
 	}
 	if levels := model.SupportedEfforts(); len(levels) > 0 {
 		fields["supported_reasoning_efforts"] = levels
+		policy := ReasoningCompatible
+		if len(policies) > 0 && policies[0] == ReasoningStrict {
+			policy = ReasoningStrict
+		}
+		fields["reasoning_effort_policy"] = string(policy)
+		if policy == ReasoningCompatible {
+			if mapping := model.compatibleEffortMapping(); len(mapping) > 0 {
+				fields["reasoning_effort_mapping"] = mapping
+			}
+		}
 	}
 	if effort := model.DefaultEffort(); effort != "" {
 		fields["default_reasoning_effort"] = effort

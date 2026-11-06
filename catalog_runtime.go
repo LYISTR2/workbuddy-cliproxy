@@ -17,16 +17,18 @@ import (
 
 type catalogConfiguration struct {
 	Catalog struct {
-		Channel         string `yaml:"channel"`
-		TTLSeconds      int    `yaml:"ttl-seconds"`
-		MaxStaleSeconds int    `yaml:"max-stale-seconds"`
+		Channel         string                  `yaml:"channel"`
+		TTLSeconds      int                     `yaml:"ttl-seconds"`
+		MaxStaleSeconds int                     `yaml:"max-stale-seconds"`
+		ReasoningPolicy catalog.ReasoningPolicy `yaml:"reasoning-effort-policy"`
 	} `yaml:"catalog"`
 }
 type catalogRuntimeState struct {
-	mu        sync.RWMutex
-	manager   *catalog.Manager
-	snapshots map[string]catalog.Snapshot
-	options   catalog.Options
+	mu              sync.RWMutex
+	manager         *catalog.Manager
+	snapshots       map[string]catalog.Snapshot
+	options         catalog.Options
+	reasoningPolicy catalog.ReasoningPolicy
 }
 
 var dynamicCatalog = &catalogRuntimeState{snapshots: map[string]catalog.Snapshot{}}
@@ -58,6 +60,13 @@ func configureCatalog(raw []byte) error {
 	if options.MaxStale <= 0 {
 		options.MaxStale = 24 * time.Hour
 	}
+	policy := settings.Catalog.ReasoningPolicy
+	if policy == "" {
+		policy = catalog.ReasoningCompatible
+	}
+	if !policy.Valid() {
+		return fmt.Errorf("catalog.reasoning-effort-policy must be compatible or strict")
+	}
 	dynamicCatalog.mu.Lock()
 	defer dynamicCatalog.mu.Unlock()
 	if dynamicCatalog.manager == nil {
@@ -71,6 +80,7 @@ func configureCatalog(raw []byte) error {
 		dynamicCatalog.snapshots = map[string]catalog.Snapshot{}
 	}
 	dynamicCatalog.options = options
+	dynamicCatalog.reasoningPolicy = policy
 	return nil
 }
 func catalogCredentials(sa *storedAuth) catalog.Credentials {
@@ -181,7 +191,10 @@ func prepareUpstreamPayload(req pluginapi.ExecutorRequest, sa *storedAuth) ([]by
 	if err = normalizeToolChoice(body); err != nil {
 		return nil, err
 	}
-	if err = model.ApplyReasoning(body); err != nil {
+	dynamicCatalog.mu.RLock()
+	policy := dynamicCatalog.reasoningPolicy
+	dynamicCatalog.mu.RUnlock()
+	if err = model.ApplyReasoningWithPolicy(body, policy); err != nil {
 		return nil, &requestError{status: 400, message: err.Error()}
 	}
 	result, err := json.Marshal(body)
@@ -220,6 +233,7 @@ func handleCatalogResponse(raw []byte) ([]byte, error) {
 		return okEnvelope(unchanged)
 	}
 	dynamicCatalog.mu.RLock()
+	policy := dynamicCatalog.reasoningPolicy
 	snapshots := make([]catalog.Snapshot, 0, len(dynamicCatalog.snapshots))
 	for _, snapshot := range dynamicCatalog.snapshots {
 		snapshots = append(snapshots, snapshot)
@@ -235,7 +249,7 @@ func handleCatalogResponse(raw []byte) ([]byte, error) {
 		var variants []map[string]any
 		for _, snapshot := range snapshots {
 			if model, found := snapshot.Find(id); found {
-				variants = append(variants, snapshot.PublicFields(model, time.Now()))
+				variants = append(variants, snapshot.PublicFields(model, time.Now(), policy))
 			}
 		}
 		if len(variants) == 1 {

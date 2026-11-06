@@ -1,6 +1,6 @@
 # workbuddy-cliproxy
 
-本 fork 的 **v0.3.2** 使用 WorkBuddy 国内版官方网页授权（`platform=workbuddy`）和账号的实时模型目录，适配 CPA v8.0.56。更新说明见 [CHANGELOG](CHANGELOG.md)。模型由上游返回，后续新增模型无需逐个修改源码；模型重新注册的刷新方式见 [动态模型目录](docs/dynamic-models.md#定期刷新)。
+本 fork 的 **v0.3.3** 使用 WorkBuddy 国内版官方网页授权（`platform=workbuddy`）和账号的实时模型目录，适配 CPA v8.0.56。更新说明见 [CHANGELOG](CHANGELOG.md)。模型由上游返回，后续新增模型无需逐个修改源码；模型重新注册的刷新方式见 [动态模型目录](docs/dynamic-models.md#定期刷新)。
 
 把**腾讯 WorkBuddy 国内版**（`www.workbuddy.cn`）封装成 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)(CPA)插件,任何支持 OpenAI / Anthropic 协议的客户端(Claude Code、Cursor、Cline、SDK……)都能直接调用 WorkBuddy 背后的模型。
 
@@ -24,7 +24,7 @@
 
 v0.3.1 的客户端标识缺少可解析的版本号，会导致模型目录被网关以 `12403` 拒绝。v0.3.2 使用统一的 WorkBuddy 版本标识、IDE 名称/类型/版本和域信息，并兼容旧凭据缺少用户 ID 的情况。
 
-升级时先保留现有账号文件，替换对应架构的 `workbuddy.so` 并重启 CPA；确认插件版本显示 `0.3.2`，再查看该凭据支持的模型。目录按账号重新发现，不用手写模型名单。若凭据本身已经失效，仍需要重新进行 WorkBuddy 授权。
+升级时先保留现有账号文件，替换对应架构的 `workbuddy.so` 并重启 CPA；确认插件版本显示 `0.3.3`，再查看该凭据支持的模型。目录按账号重新发现，不用手写模型名单。若凭据本身已经失效，仍需要重新进行 WorkBuddy 授权。
 
 目录失败时，CPA 日志会保留上游数字错误码；`12403` 指向客户端版本校验，HTTP `401/403` 指向账号鉴权。
 
@@ -107,7 +107,16 @@ curl http://localhost:8317/v1/chat/completions \
 
 ## 思考模式
 
-客户端显式传入的 `reasoning_effort` 会保留；省略时使用上游模型配置的默认值，不再将所有 Hy3 请求强制改成 `high`。只有上游明确提供 `supportedEfforts` 时才按该列表校验，不能把默认档位推断成唯一可用档位。上游不允许的显式档位会返回 HTTP 400。
+目录支持的显式 `reasoning_effort` 保持不变；省略时使用上游模型配置的默认值。v0.3.3 默认采用 `compatible` 策略：若客户端传入 `medium` 等通用档位，而上游明确列出的档位不包含它，就转换为最接近的可用档位。例如目录为 `low/high/max` 时，`medium` 转为 `high`、`xhigh` 转为 `max`。不会把这些别名冒充为上游原生能力。
+
+对声明了档位集合的模型，未知档位仍返回 HTTP 400；错误类型和上游明确禁止的关闭思考请求也继续拒绝。若需要保持原先的严格校验，可在插件配置中设置：
+
+```yaml
+catalog:
+  reasoning-effort-policy: strict
+```
+
+`/v1/models` 额外公布 `reasoning_effort_policy` 和兼容模式下的 `reasoning_effort_mapping`，`supported_reasoning_efforts` 仍只列上游真实档位。完整规则见 [动态模型目录](docs/dynamic-models.md)。
 
 `model` 使用目录中的真实 ID，思考档位通过单独的 `reasoning_effort` 字段传入。思考内容仍走 SSE 的 `delta.reasoning_content`。
 

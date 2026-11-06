@@ -315,7 +315,7 @@ func wbRegistration() registration {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             providerName,
-			Version:          "0.3.2",
+			Version:          "0.3.3",
 			Author:           "lovingfish (clean-room rebuild; original workbuddy by Sliverkiss)",
 			GitHubRepository: "https://github.com/LYISTR2/workbuddy-cliproxy",
 		},

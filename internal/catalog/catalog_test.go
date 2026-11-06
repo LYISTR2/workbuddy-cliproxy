@@ -61,7 +61,7 @@ func TestParseEmptyChannelIsAuthoritative(t *testing.T) {
 		t.Fatalf("snapshot=%v err=%v", snapshot, err)
 	}
 }
-func TestReasoningPreservesExplicitChoiceAndValidatesPublishedLevels(t *testing.T) {
+func TestReasoningPreservesSupportedChoicesAndAdaptsGenericLevels(t *testing.T) {
 	snapshot, _ := Parse([]byte(fixture), "cli", time.Now())
 	hy3, _ := snapshot.Find("hy3")
 	body := map[string]any{"reasoning_effort": "low"}
@@ -73,8 +73,9 @@ func TestReasoningPreservesExplicitChoiceAndValidatesPublishedLevels(t *testing.
 		t.Fatal("provider default was not used")
 	}
 	glm, _ := snapshot.Find("glm-5.3-flash")
-	if err := glm.ApplyReasoning(map[string]any{"reasoning_effort": "xhigh"}); err == nil {
-		t.Fatal("unsupported level accepted")
+	body = map[string]any{"reasoning_effort": "xhigh"}
+	if err := glm.ApplyReasoning(body); err != nil || body["reasoning_effort"] != "max" {
+		t.Fatal("generic effort was not translated to a native level")
 	}
 	body = map[string]any{"thinking": map[string]any{"type": "disabled"}}
 	if err := glm.ApplyReasoning(body); err != nil || body["reasoning_effort"] != "none" {

@@ -20,6 +20,8 @@
 | `reasoning` | 经过字段筛选的原生思考配置 |
 | `supported_reasoning_efforts` | 仅在上游明确枚举时出现 |
 | `default_reasoning_effort` | 默认档位，不代表只支持这一档 |
+| `reasoning_effort_policy` | 当前采用 `compatible` 或 `strict` 策略 |
+| `reasoning_effort_mapping` | 兼容模式下，通用输入档位到原生档位的实际映射 |
 | `pricing` | 倍率显示值、来源，以及可得的优惠和档位规则 |
 | `catalog` | 渠道、来源、拉取时间、新鲜度和目录状态 |
 | `supports_images` / `supports_reasoning` | 上游声明的能力 |
@@ -75,6 +77,7 @@ plugins:
         channel: cli
         ttl-seconds: 300
         max-stale-seconds: 86400
+        reasoning-effort-policy: compatible
 ```
 
 缓存按用户、企业、域、渠道和令牌隔离。同一缓存条目的并发请求合并拉取。
@@ -83,10 +86,20 @@ plugins:
 若宿主仍保留模型注册但插件已无可靠元数据，则返回
 `catalog.availability: metadata_unavailable`，不附带旧价格。
 
-显式 `reasoning_effort` 会保留；上游提供 `supportedEfforts` 时才校验枚举。
-仅提供默认档位不意味着只能使用该档位。省略参数时使用上游默认值，
-关闭思考的请求按 `canDisableThinking` 处理。请使用真实模型 ID 和单独的
-`reasoning_effort` 字段。
+目录支持的显式 `reasoning_effort` 保持不变，省略参数时使用上游默认值。仅提供默认档位不意味着只能使用该档位。
+
+默认 `reasoning-effort-policy: compatible`：只对上游明确提供 `supportedEfforts` 的模型，将不在原生集合中的通用档位按 `minimal < low < medium < high < xhigh < max` 归一。优先选不低于请求的最近档位；若超过上游最高档，则采用最高可用档。候选值始终取自该模型真实公布的集合。
+
+| 客户端输入 | 目录档位 | 上游接收 |
+| --- | --- | --- |
+| `medium` | `low/high/max` | `high` |
+| `xhigh` | `low/high/max` | `max` |
+| `max` | `low/high/xhigh` | `xhigh` |
+| `low` | `low/high/max` | `low`（不改写） |
+
+`strict` 策略保留原先的枚举校验，不在目录中的档位直接返回 HTTP 400，并列出可用值。无论选择哪种策略，未知字符串、错误类型和上游明确禁止的关闭思考请求都不会自动替换成开启思考。`none` 不参与强度排序，仍按 `canDisableThinking` 处理。
+
+未声明 `supportedEfforts` 时不推断可用档位，继续保留客户端的显式值。兼容输入也不会被加入 `supported_reasoning_efforts` 或宿主 Thinking Levels；实际映射通过独立的 `reasoning_effort_mapping` 公布。来自嵌套 `reasoning.effort` 的输入归一后只保留平铺的 `reasoning_effort`，其余 reasoning 设置保留。
 
 ## 定期刷新
 
@@ -96,7 +109,7 @@ TTL 控制插件的按需发现缓存。CPA 的模型注册还需要宿主触发
 `/v1/models` 的拉取时间是否更新，不重启 CPA，也不修改账号令牌。
 
 当前脚本面向单账号目录，要求已经登录、存在可用模型且插件版本为
-`0.2.0-catalog`、`0.3.0`、`0.3.1` 或本 fork 的 `0.3.2`。多账号 `catalog_variants` 的刷新验证尚未支持。
+`0.2.0-catalog`、`0.3.0`、`0.3.1`、`0.3.2` 或本 fork 的 `0.3.3`。多账号 `catalog_variants` 的刷新验证尚未支持。
 Python 3 标准库即可运行：
 
 ```bash
