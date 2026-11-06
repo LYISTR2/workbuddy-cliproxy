@@ -24,7 +24,7 @@ func TestBusinessAuthFailureInvalidatesLastGoodCatalog(t *testing.T) {
 				t.Fatal(err)
 			}
 			response = []byte(`{"code":` + code + `,"data":{}}`)
-			manager.Reconfigure(Options{})
+			manager.Invalidate()
 			if _, err := manager.Get(context.Background(), credentials); err == nil {
 				t.Fatal("business authentication error reused a stale catalog")
 			}

@@ -151,10 +151,10 @@ func TestManagerRetainsBoundedLastGoodCatalogButNotUnauthorized(t *testing.T) {
 		t.Fatal("stale cache never expires")
 	}
 	failure = nil
-	manager.Reconfigure(Options{TTL: time.Minute})
+	manager.Invalidate()
 	_, _ = manager.Get(context.Background(), auth)
 	failure = &HTTPError{Status: 401}
-	manager.Reconfigure(Options{TTL: time.Minute})
+	manager.Invalidate()
 	if _, err := manager.Get(context.Background(), auth); err == nil {
 		t.Fatal("unauthorized reused cached capabilities")
 	}

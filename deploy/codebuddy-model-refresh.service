@@ -1,5 +1,5 @@
 [Unit]
-Description=Refresh CodeBuddy account model catalog
+Description=Refresh WorkBuddy account model catalog
 After=network-online.target cliproxyapi.service
 Wants=network-online.target
 

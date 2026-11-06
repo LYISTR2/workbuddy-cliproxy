@@ -1,6 +1,6 @@
 # workbuddy-cliproxy
 
-本 fork 的 **v0.3.4** 使用 WorkBuddy 国内版官方网页授权（`platform=workbuddy`）和账号的实时模型目录，适配 CPA v8.0.56。更新说明见 [CHANGELOG](CHANGELOG.md)。模型由上游返回，后续新增模型无需逐个修改源码；模型重新注册的刷新方式见 [动态模型目录](docs/dynamic-models.md#定期刷新)。
+本 fork 的 **v0.4.0** 使用 WorkBuddy 国内版官方网页授权（`platform=workbuddy`）和账号的实时模型目录，适配 CPA v8.0.56。更新说明见 [CHANGELOG](CHANGELOG.md)。模型由上游返回，后续新增模型无需逐个修改源码；模型重新注册的刷新方式见 [动态模型目录](docs/dynamic-models.md#定期刷新)。
 
 把**腾讯 WorkBuddy 国内版**（`www.workbuddy.cn`）封装成 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)(CPA)插件,任何支持 OpenAI / Anthropic 协议的客户端(Claude Code、Cursor、Cline、SDK……)都能直接调用 WorkBuddy 背后的模型。
 
@@ -10,7 +10,7 @@
 
 在 CPA 里注册为 `workbuddy` provider：通过 `https://www.workbuddy.cn/v2/plugin/auth/state?platform=workbuddy` 获取官方授权链接，打开 WorkBuddy 登录网页，轮询 token，再通过 `/v2/plugin/account` 读取账号资料；聊天请求转发到 `www.workbuddy.cn/v2/chat/completions`。
 
-升级后请在 CPA 中重新添加一次 WorkBuddy 授权，并停用不再使用的旧入口凭据。现有凭据不会自动改写，`workbuddy` provider 名和账号文件格式保持兼容。
+升级时保留已有凭据，替换插件并重启 CPA；只有凭据已失效时才需要重新授权。`workbuddy` provider 名和账号文件格式保持兼容。
 
 ## 模型
 
@@ -20,11 +20,17 @@
 
 标准 `GET /v1/models` 保留 `id`、`object`、`owned_by`，并补充上游公布的显示名称、思考档位、积分倍率和目录更新时间。字段与缓存行为见 [动态模型目录](docs/dynamic-models.md)。
 
+## CPA 登录和剩余额度
+
+v0.4.0 在 CPA 原生 OAuth 入口提供 WorkBuddy 名称和内置标识，支持多个账号独立保存与自动刷新；旧 `workbuddy.json` 保留原路径。支持额度插件的 CPA / 面板会显示 WorkBuddy 额度卡片，按个人资源包或企业额度展示剩余量、总量及重置时间。查询失败会明确报错。
+
+使用流程、配置与宿主版本要求见 [CPA 集成](docs/cpa-integration.md)。本次用户审查报告中的 20 项问题及对应验证见 [审查修复清单](docs/review-fixes.md)。
+
 ## 模型列表为空的修复
 
 v0.3.1 的客户端标识缺少可解析的版本号，会导致模型目录被网关以 `12403` 拒绝。v0.3.2 使用统一的 WorkBuddy 版本标识、IDE 名称/类型/版本和域信息，并兼容旧凭据缺少用户 ID 的情况。
 
-升级时先保留现有账号文件，替换对应架构的 `workbuddy.so` 并重启 CPA；确认插件版本显示 `0.3.4`，再查看该凭据支持的模型。目录按账号重新发现，不用手写模型名单。若凭据本身已经失效，仍需要重新进行 WorkBuddy 授权。
+升级时先保留现有账号文件，替换对应架构的 `workbuddy.so` 并重启 CPA；确认插件版本显示 `0.4.0`，再查看该凭据支持的模型。目录按账号重新发现，不用手写模型名单。若凭据本身已经失效，仍需要重新进行 WorkBuddy 授权。
 
 目录失败时，CPA 日志会保留上游数字错误码；`12403` 指向客户端版本校验，HTTP `401/403` 指向账号鉴权。
 

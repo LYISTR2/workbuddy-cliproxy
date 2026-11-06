@@ -55,9 +55,12 @@ type Snapshot struct {
 	FetchedAt  time.Time
 	FreshUntil time.Time
 	Stale      bool
+	index      map[string]int
 }
 type HTTPError struct{ Status, Code int }
 
+func (e *HTTPError) StatusCode() int   { return e.Status }
+func (e *HTTPError) UpstreamCode() int { return e.Code }
 func (e *HTTPError) Error() string {
 	if e.Code != 0 {
 		return fmt.Sprintf("catalog HTTP %d: %s", e.Status, (&BusinessError{Code: e.Code}).Error())
@@ -66,6 +69,8 @@ func (e *HTTPError) Error() string {
 }
 
 type BusinessError struct{ Code int }
+
+func (e *BusinessError) UpstreamCode() int { return e.Code }
 
 func (e *BusinessError) Error() string {
 	if e.Code == 12403 {
@@ -81,6 +86,8 @@ type cacheEntry struct {
 	forced     bool
 	retryAfter time.Time
 	lastError  error
+	tokenHash  [32]byte
+	lastUsed   time.Time
 }
 type Manager struct {
 	mu      sync.Mutex
@@ -93,9 +100,17 @@ type Manager struct {
 func NewManager(fetch Fetcher, options Options) *Manager {
 	return &Manager{entries: map[string]*cacheEntry{}, fetch: fetch, now: time.Now, options: options.normalized()}
 }
+
+// Reconfigure preserves a fresh cache when unrelated plugin settings change.
 func (m *Manager) Reconfigure(options Options) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.options = options.normalized()
+}
+
+// Invalidate is explicit; maintenance can request discovery without changing TTL.
+func (m *Manager) Invalidate() {
+	m.mu.Lock()
 	entries := make([]*cacheEntry, 0, len(m.entries))
 	for _, e := range m.entries {
 		entries = append(entries, e)
@@ -108,31 +123,70 @@ func (m *Manager) Reconfigure(options Options) {
 	}
 }
 func scopeKey(c Credentials, channel string) string {
-	sum := sha256.Sum256([]byte(c.UID + "\x00" + c.EnterpriseID + "\x00" + c.Domain + "\x00" + channel + "\x00" + c.AccessToken))
+	sum := sha256.Sum256([]byte(c.UID + "\x00" + c.EnterpriseID + "\x00" + c.Domain + "\x00" + channel))
 	return hex.EncodeToString(sum[:])
 }
+
+// Get returns a defensive copy for callers that need to modify the catalog.
 func (m *Manager) Get(ctx context.Context, c Credentials) (Snapshot, error) {
+	s, err := m.View(ctx, c)
+	if err != nil {
+		return s, err
+	}
+	return cloneSnapshot(s), nil
+}
+
+// View returns immutable models with an independent freshness wrapper. Callers
+// must not modify the Models slice or nested metadata. Used on the chat hot path.
+func (m *Manager) View(ctx context.Context, c Credentials) (Snapshot, error) {
 	if c.AccessToken == "" || c.UID == "" {
 		return Snapshot{}, fmt.Errorf("catalog requires an authenticated account")
 	}
 	m.mu.Lock()
 	options := m.options
 	key := scopeKey(c, options.Channel)
+	// Bound abandoned accounts/channels as well as token rotations.
+	now := m.now()
+	for k, e := range m.entries {
+		if now.Sub(e.lastUsed) > options.MaxStale {
+			delete(m.entries, k)
+		}
+	}
+	if len(m.entries) >= 256 && m.entries[key] == nil {
+		var oldest string
+		var when time.Time
+		for k, e := range m.entries {
+			if oldest == "" || e.lastUsed.Before(when) {
+				oldest = k
+				when = e.lastUsed
+			}
+		}
+		delete(m.entries, oldest)
+	}
 	entry := m.entries[key]
 	if entry == nil {
 		entry = &cacheEntry{}
 		m.entries[key] = entry
 	}
+	entry.lastUsed = now
 	m.mu.Unlock()
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
-	now := m.now()
+	if err := ctx.Err(); err != nil {
+		return Snapshot{}, err
+	}
+	tokenHash := sha256.Sum256([]byte(c.AccessToken))
+	if entry.tokenHash != tokenHash {
+		entry.tokenHash = tokenHash
+		entry.forced = true
+		entry.snapshot = nil
+	}
 	if entry.snapshot != nil && !entry.forced && now.Before(entry.snapshot.FreshUntil) {
-		return cloneSnapshot(*entry.snapshot), nil
+		return *entry.snapshot, nil
 	}
 	if !entry.forced && now.Before(entry.retryAfter) {
 		if entry.snapshot != nil && now.Sub(entry.snapshot.FetchedAt) <= options.MaxStale {
-			result := cloneSnapshot(*entry.snapshot)
+			result := *entry.snapshot
 			result.Stale = true
 			return result, nil
 		}
@@ -148,7 +202,7 @@ func (m *Manager) Get(ctx context.Context, c Credentials) (Snapshot, error) {
 			entry.forced = false
 			entry.retryAfter = time.Time{}
 			entry.lastError = nil
-			return cloneSnapshot(snapshot), nil
+			return snapshot, nil
 		}
 	}
 	denied := false
@@ -163,7 +217,7 @@ func (m *Manager) Get(ctx context.Context, c Credentials) (Snapshot, error) {
 		entry.snapshot = nil
 	}
 	if !denied && entry.snapshot != nil && now.Sub(entry.snapshot.FetchedAt) <= options.MaxStale {
-		result := cloneSnapshot(*entry.snapshot)
+		result := *entry.snapshot
 		result.Stale = true
 		return result, nil
 	}
@@ -265,7 +319,7 @@ func Parse(raw []byte, channel string, now time.Time) (Snapshot, error) {
 		}
 		pool[id] = rawModel
 	}
-	snapshot := Snapshot{Channel: channel, FetchedAt: now.UTC(), Models: []Model{}}
+	snapshot := Snapshot{Channel: channel, FetchedAt: now.UTC(), Models: []Model{}, index: map[string]int{}}
 	seen := map[string]bool{}
 	for _, id := range allowed {
 		model, ok := pool[id]
@@ -313,6 +367,7 @@ func Parse(raw []byte, channel string, now time.Time) (Snapshot, error) {
 				item.Tier = publicRule(selected)
 			}
 		}
+		snapshot.index[item.ID] = len(snapshot.Models)
 		snapshot.Models = append(snapshot.Models, item)
 	}
 	return snapshot, nil
@@ -374,12 +429,52 @@ func cloneValue(value any) any {
 	return result
 }
 func cloneSnapshot(value Snapshot) Snapshot {
-	raw, _ := json.Marshal(value)
-	var result Snapshot
-	_ = json.Unmarshal(raw, &result)
+	result := value
+	result.Models = make([]Model, len(value.Models))
+	for i, model := range value.Models {
+		result.Models[i] = model
+		result.Models[i].Public = cloneMap(model.Public)
+		result.Models[i].Reasoning = cloneMap(model.Reasoning)
+		result.Models[i].Tier = cloneMap(model.Tier)
+		result.Models[i].Promotions = make([]map[string]any, len(model.Promotions))
+		for j, p := range model.Promotions {
+			result.Models[i].Promotions[j] = cloneMap(p)
+		}
+	}
 	return result
 }
+func cloneMap(value map[string]any) map[string]any {
+	if value == nil {
+		return nil
+	}
+	result := make(map[string]any, len(value))
+	for k, v := range value {
+		result[k] = copyValue(v)
+	}
+	return result
+}
+func copyValue(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		return cloneMap(v)
+	case []any:
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = copyValue(item)
+		}
+		return out
+	default:
+		return value
+	}
+}
 func (s Snapshot) Find(id string) (Model, bool) {
+	if s.index != nil {
+		i, ok := s.index[id]
+		if !ok {
+			return Model{}, false
+		}
+		return s.Models[i], true
+	}
 	for _, m := range s.Models {
 		if m.ID == id {
 			return m, true

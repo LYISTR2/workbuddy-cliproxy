@@ -1,7 +1,7 @@
 // Package main implements the workbuddy CLIProxyAPI dynamic plugin.
 //
 // workbuddy wraps Tencent WorkBuddy China (www.workbuddy.cn) as a cliproxy
-// provider: it performs the CodeBuddy web login flow, refreshes access
+// provider: it performs the WorkBuddy web login flow, refreshes access
 // tokens, and forwards OpenAI-compatible chat completion requests to the
 // upstream /v2/chat/completions endpoint.
 //
@@ -59,6 +59,7 @@ import "C"
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -68,9 +69,11 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/lovingfish/workbuddy-cliproxy/internal/workbuddy"
@@ -78,6 +81,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
+
+var version = "0.4.0" // Release builds may override with -ldflags -X main.version=...
 
 const (
 	providerName = "workbuddy"
@@ -102,6 +107,7 @@ type loginCtx struct {
 	expires        time.Time
 	token          *tokenData // auth/token is one-shot; retain it while account data is pending.
 	tokenExpiresAt int64
+	timer          *time.Timer
 }
 
 var (
@@ -141,6 +147,10 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 		return 1
 	}
 	var requestBytes []byte
+	if uint64(requestLen) > 32<<20 || (request == nil && requestLen > 0) {
+		writeResponse(response, errorEnvelope("invalid_request", "RPC request exceeds limit or has no buffer", 413))
+		return 1
+	}
 	if request != nil && requestLen > 0 {
 		requestBytes = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
 	}
@@ -166,7 +176,7 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 }
 
 //export cliproxyPluginShutdown
-func cliproxyPluginShutdown() {}
+func cliproxyPluginShutdown() { shutdownPlugin() }
 
 // -----------------------------------------------------------------------------
 // Host calls (async streaming)
@@ -191,7 +201,7 @@ func hostCall(method string, request []byte) ([]byte, error) {
 	var resp C.cliproxy_buffer
 	rc := C.wb_call_host(hostAPI, cMethod, (*C.uint8_t)(cReq), reqLen, &resp)
 	var out []byte
-	if resp.ptr != nil && resp.len > 0 {
+	if resp.ptr != nil && resp.len > 0 && uint64(resp.len) <= 32<<20 {
 		out = C.GoBytes(resp.ptr, C.int(resp.len))
 	}
 	if resp.ptr != nil && hostAPI.free_buffer != nil {
@@ -206,21 +216,26 @@ func hostCall(method string, request []byte) ([]byte, error) {
 // streamEmit pushes one chunk payload to the host stream. Returns an error if
 // the host rejected it (e.g. the client already disconnected and the stream
 // was closed), which the pump uses to stop reading a dead upstream.
+var hostCallFn = hostCall
+
 func streamEmit(streamID string, payload []byte) error {
 	if streamID == "" {
 		return fmt.Errorf("no stream id")
 	}
 	body, _ := json.Marshal(map[string]any{"stream_id": streamID, "payload": payload})
-	_, err := hostCall(pluginabi.MethodHostStreamEmit, body)
+	_, err := hostCallFn(pluginabi.MethodHostStreamEmit, body)
 	return err
 }
 
-func streamEmitError(streamID, message string) {
+func streamEmitError(streamID, message string) { streamEmitFailure(streamID, errors.New(message)) }
+
+func streamEmitFailure(streamID string, err error) {
+	message := publicError(err)
 	if streamID == "" {
 		return
 	}
-	body, _ := json.Marshal(map[string]any{"stream_id": streamID, "error": message})
-	_, _ = hostCall(pluginabi.MethodHostStreamEmit, body)
+	body, _ := json.Marshal(map[string]any{"stream_id": streamID, "error": message, "error_detail": map[string]any{"code": "upstream_error", "message": message, "http_status": errorStatus(err)}})
+	_, _ = hostCallFn(pluginabi.MethodHostStreamEmit, body)
 }
 
 func streamClose(streamID string) {
@@ -228,7 +243,7 @@ func streamClose(streamID string) {
 		return
 	}
 	body, _ := json.Marshal(map[string]any{"stream_id": streamID})
-	_, _ = hostCall(pluginabi.MethodHostStreamClose, body)
+	_, _ = hostCallFn(pluginabi.MethodHostStreamClose, body)
 }
 
 // -----------------------------------------------------------------------------
@@ -249,7 +264,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodResponseInterceptAfter:
 		return handleCatalogResponse(request)
 	case pluginabi.MethodAuthIdentifier:
-		return okEnvelope(identifierResponse{Identifier: providerName})
+		return okEnvelope(map[string]any{"identifier": providerName, "entries": []map[string]string{{"identifier": providerName, "name": "WorkBuddy", "logo": workbuddyLogo}}})
 	case pluginabi.MethodAuthParse:
 		return handleParseAuth(request)
 	case pluginabi.MethodAuthLoginStart:
@@ -264,8 +279,19 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleExecExecute(request)
 	case pluginabi.MethodExecutorExecuteStream:
 		return handleExecStream(request)
+	case "quota.identifier":
+		return okEnvelope(identifierResponse{Identifier: providerName})
+	case "quota.describe":
+		return okEnvelope(map[string]any{"supported_providers": []string{providerName}, "display_name": "WorkBuddy", "supports_reset": false})
+	case "quota.fetch":
+		return handleQuotaFetch(request)
+	case "quota.reset":
+		return nil, &requestError{status: 501, message: "WorkBuddy quota cannot be reset by the plugin"}
+	case pluginabi.MethodPluginShutdown, "plugin.quiesce":
+		shutdownPlugin()
+		return okEnvelope(map[string]any{})
 	default:
-		return errorEnvelope("unknown_method", "unknown method: "+method), nil
+		return nil, &requestError{status: 501, message: "unknown method: " + truncate(method, 100)}
 	}
 }
 
@@ -296,6 +322,7 @@ type registration struct {
 }
 
 type registrationCapability struct {
+	QuotaProvider         bool                         `json:"quota_provider"`
 	ResponseInterceptor   bool                         `json:"response_interceptor"`
 	ModelProvider         bool                         `json:"model_provider"`
 	AuthProvider          bool                         `json:"auth_provider"`
@@ -315,11 +342,13 @@ func wbRegistration() registration {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             providerName,
-			Version:          "0.3.4",
+			Version:          version,
+			Logo:             workbuddyLogo,
 			Author:           "lovingfish (clean-room rebuild; original workbuddy by Sliverkiss)",
 			GitHubRepository: "https://github.com/LYISTR2/workbuddy-cliproxy",
 		},
 		Capabilities: registrationCapability{
+			QuotaProvider:         true,
 			ModelProvider:         true,
 			AuthProvider:          true,
 			Executor:              true,
@@ -337,6 +366,7 @@ func wbRegistration() registration {
 
 // storedAuth is the on-disk shape of a workbuddy credential.
 type storedAuth struct {
+	Type    string        `json:"type,omitempty"`
 	Auth    storedTokens  `json:"auth"`
 	Account storedAccount `json:"account"`
 }
@@ -388,6 +418,9 @@ func parseStored(raw []byte) (*storedAuth, error) {
 	if err := json.Unmarshal(raw, &sa); err != nil {
 		return nil, fmt.Errorf("storage_parse_error: %w", err)
 	}
+	if sa.Type != "" && sa.Type != providerName {
+		return nil, fmt.Errorf("foreign credential provider")
+	}
 	if sa.Auth.AccessToken == "" {
 		return nil, fmt.Errorf("parse_error: missing accessToken")
 	}
@@ -400,7 +433,6 @@ func parseStored(raw []byte) (*storedAuth, error) {
 
 func sharedHTTPClient() *http.Client {
 	httpClientOnce.Do(func() {
-		jar, _ := cookiejar.New(nil)
 		sharedClient = &http.Client{
 			Timeout: 120 * time.Second,
 			Transport: &http.Transport{
@@ -412,7 +444,7 @@ func sharedHTTPClient() *http.Client {
 				IdleConnTimeout:       90 * time.Second,
 				MaxIdleConnsPerHost:   5,
 			},
-			Jar: jar,
+			CheckRedirect: refuseRedirect,
 		}
 	})
 	return sharedClient
@@ -423,9 +455,10 @@ func sharedHTTPClient() *http.Client {
 func newLoginClient() *http.Client {
 	jar, _ := cookiejar.New(nil)
 	return &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: sharedHTTPClient().Transport,
-		Jar:       jar,
+		Timeout:       30 * time.Second,
+		Transport:     sharedHTTPClient().Transport,
+		Jar:           jar,
+		CheckRedirect: refuseRedirect,
 	}
 }
 
@@ -452,9 +485,6 @@ func backendHeaders(req *http.Request, sa *storedAuth) {
 	} else {
 		req.Header.Set("X-No-Enterprise-Id", "1")
 	}
-	if sa.Auth.RefreshToken != "" {
-		req.Header.Set("X-Refresh-Token", sa.Auth.RefreshToken)
-	}
 	if sa.Auth.Domain != "" {
 		req.Header.Set("X-Domain", sa.Auth.Domain)
 	} else {
@@ -466,7 +496,7 @@ func backendHeaders(req *http.Request, sa *storedAuth) {
 // doJSON sends method to fullURL with the given headers, parses the {code,msg,data}
 // envelope, and returns the inner data payload. httpStatus is the upstream code.
 func doJSON(client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {
-	req, err := http.NewRequest(method, fullURL, body)
+	req, err := http.NewRequestWithContext(pluginContext(), method, fullURL, body)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -477,19 +507,22 @@ func doJSON(client *http.Client, method, fullURL string, headers func(*http.Requ
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("WorkBuddy API transport failed")
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, err := readLimited(resp.Body, maxJSONResponseBytes)
+	if err != nil {
+		return nil, resp.StatusCode, err
+	}
 	if resp.StatusCode >= 400 {
-		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream %d", resp.StatusCode)
+		return nil, resp.StatusCode, &upstreamAPIError{Status: resp.StatusCode}
 	}
 	var env apiEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("parse failed: %w", err)
+		return nil, resp.StatusCode, fmt.Errorf("WorkBuddy returned invalid API JSON")
 	}
 	if env.Code != 0 {
-		return nil, resp.StatusCode, fmt.Errorf("code=%d msg=%s", env.Code, env.Msg)
+		return nil, resp.StatusCode, &upstreamAPIError{Status: resp.StatusCode, Code: env.Code}
 	}
 	return env.Data, resp.StatusCode, nil
 }
@@ -503,6 +536,9 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	if req.Provider != "" && req.Provider != providerName {
+		return okEnvelope(pluginapi.AuthParseResponse{Handled: false})
+	}
 	sa, err := parseStored(req.RawJSON)
 	if err != nil {
 		// Not a workbuddy credential; let the host try other providers.
@@ -510,24 +546,37 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 	}
 	return okEnvelope(pluginapi.AuthParseResponse{
 		Handled: true,
-		Auth:    toAuthData(sa),
+		Auth:    parsedAuthData(sa, req),
 	})
 }
 
 func toAuthData(sa *storedAuth) pluginapi.AuthData {
 	storage, _ := json.Marshal(sa)
-	return pluginapi.AuthData{
-		Provider:    providerName,
-		ID:          providerName,
-		FileName:    authFileName,
-		Label:       "WorkBuddy",
-		StorageJSON: storage,
-		Metadata:    map[string]any{"type": providerName},
+	id, file := authIdentity(sa)
+	metadata := map[string]any{"type": providerName, "uid": sa.Account.UID, "nickname": sa.Account.Nickname}
+	if sa.Auth.RefreshToken != "" {
+		metadata["refresh_interval_seconds"] = 300
 	}
+	if sa.Auth.ExpiresAt > 0 {
+		metadata["expires_at"] = time.Unix(sa.Auth.ExpiresAt, 0).UTC().Format(time.RFC3339)
+	}
+	return pluginapi.AuthData{Provider: providerName, ID: id, FileName: file,
+		Label:       "WorkBuddy · " + firstNonEmpty(sa.Account.Nickname, sa.Account.UID, "账号"),
+		StorageJSON: storage, Metadata: metadata, NextRefreshAfter: nextRefresh(sa.Auth.ExpiresAt)}
+}
+
+func parsedAuthData(sa *storedAuth, req pluginapi.AuthParseRequest) pluginapi.AuthData {
+	auth := toAuthData(sa)
+	if file := firstNonEmpty(req.FileName, filepath.Base(req.Path)); file != "" && file != "." {
+		auth.FileName = filepath.Base(file)
+		auth.ID = "" // Preserve the host's path identity for existing files.
+	}
+	return auth
 }
 
 func handleStartLogin(raw []byte) ([]byte, error) {
-	client := newLoginClient()
+	cleanupLogins(time.Now())
+	client := rpcHTTPClient(newLoginClient(), raw)
 	data, _, err := doJSON(client, http.MethodPost, endpointAuthState, nil, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return nil, fmt.Errorf("auth state failed: %w", err)
@@ -541,7 +590,9 @@ func handleStartLogin(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	loginStates.Store(st.State, &loginCtx{client: client, expires: time.Now().Add(loginTTL)})
+	lc := &loginCtx{client: client, expires: time.Now().Add(loginTTL)}
+	loginStates.Store(st.State, lc)
+	time.AfterFunc(loginTTL, func() { loginStates.CompareAndDelete(st.State, lc) })
 	return okEnvelope(pluginapi.AuthLoginStartResponse{
 		Provider:  providerName,
 		URL:       loginURL,
@@ -586,7 +637,9 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 		return nil, fmt.Errorf("poll: unknown state (restart login)")
 	}
 	lc := v.(*loginCtx)
-	lc.mu.Lock()
+	if !lc.mu.TryLock() {
+		return loginPending("正在确认 WorkBuddy 授权")
+	}
 	defer lc.mu.Unlock()
 	if time.Now().After(lc.expires) {
 		loginStates.Delete(state)
@@ -596,13 +649,23 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 	// The host drives polling. Once issued, a token must survive account-service
 	// delays: asking auth/token for it a second time may never return it again.
 	if lc.token == nil {
-		tokRaw, _, errTok := doJSON(lc.client, http.MethodGet, endpointAuthToken+url.QueryEscape(state), nil, nil)
+		tokRaw, _, errTok := doJSON(rpcHTTPClient(lc.client, raw), http.MethodGet, endpointAuthToken+url.QueryEscape(state), nil, nil)
 		var tok tokenData
-		if errTok != nil || json.Unmarshal(tokRaw, &tok) != nil || tok.AccessToken == "" {
-			return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending, Message: "waiting for WorkBuddy login"})
+		if errTok != nil {
+			if terminalLoginError(errTok) {
+				loginStates.Delete(state)
+				return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusError, Message: publicError(errTok) + "；请重新发起 WorkBuddy 登录"})
+			}
+			return loginPending("等待在 WorkBuddy 官方网页完成授权")
+		}
+		if json.Unmarshal(tokRaw, &tok) != nil {
+			return nil, fmt.Errorf("invalid WorkBuddy token response")
+		}
+		if tok.AccessToken == "" {
+			return loginPending("等待在 WorkBuddy 官方网页完成授权")
 		}
 		lc.token = &tok
-		lc.tokenExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
+		lc.tokenExpiresAt = tokenExpiry(tok.ExpiresIn)
 	}
 	tok := lc.token
 	sa := &storedAuth{
@@ -613,12 +676,20 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 			Domain:       tok.Domain,
 		},
 	}
-	account, err := fetchWorkbuddyAccount(lc.client, sa)
+	account, err := fetchWorkbuddyAccount(rpcHTTPClient(lc.client, raw), sa)
 	if err != nil {
-		return okEnvelope(pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending, Message: "waiting for WorkBuddy account details"})
+		if terminalLoginError(err) {
+			loginStates.Delete(state)
+			return nil, err
+		}
+		return loginPending("授权已完成，正在读取 WorkBuddy 账号资料")
 	}
 	sa.Account = account
 	loginStates.Delete(state)
+	if lc.timer != nil {
+		lc.timer.Stop()
+	}
+	lc.token = nil
 	return okEnvelope(pluginapi.AuthLoginPollResponse{
 		Status: pluginapi.AuthLoginStatusSuccess,
 		Auth:   toAuthData(sa),
@@ -637,7 +708,13 @@ func fetchWorkbuddyAccount(client *http.Client, sa *storedAuth) (storedAccount, 
 	return account, nil
 }
 
-func handleRefreshAuth(raw []byte) ([]byte, error) {
+func handleRefreshAuth(raw []byte) (result []byte, failure error) {
+	started := time.Now()
+	defer func() {
+		if failure != nil {
+			diagnostic("refresh_failed", nil, failure, time.Since(started))
+		}
+	}()
 	var req pluginapi.AuthRefreshRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
@@ -645,6 +722,9 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	sa, err := parseStored(req.StorageJSON)
 	if err != nil {
 		return nil, fmt.Errorf("refresh: %w", err)
+	}
+	if strings.TrimSpace(sa.Auth.RefreshToken) == "" {
+		return nil, &requestError{status: 401, message: "refresh: missing refreshToken, re-login required"}
 	}
 	headers := func(r *http.Request) {
 		commonHeaders(r)
@@ -654,10 +734,11 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 		}
 		r.Header.Set("X-Auth-Refresh-Source", "plugin")
 	}
-	data, status, err := doJSON(sharedHTTPClient(), http.MethodPost, endpointTokenRefresh, headers, bytes.NewReader([]byte("{}")))
+	client := rpcHTTPClient(sharedHTTPClient(), raw)
+	data, status, err := doJSON(client, http.MethodPost, endpointTokenRefresh, headers, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		if status >= 400 {
-			return nil, fmt.Errorf("refresh rejected (HTTP %d)", status)
+			return nil, &requestError{status: status, message: fmt.Sprintf("refresh rejected (HTTP %d)", status)}
 		}
 		return nil, fmt.Errorf("refresh: %w", err)
 	}
@@ -672,12 +753,20 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	if tok.Domain != "" {
 		sa.Auth.Domain = tok.Domain
 	}
-	sa.Auth.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
+	sa.Auth.ExpiresAt = tokenExpiry(tok.ExpiresIn)
 	// A temporary profile error must not discard newly rotated refresh tokens.
-	if account, err := fetchWorkbuddyAccount(sharedHTTPClient(), sa); err == nil {
+	if account, err := fetchWorkbuddyAccount(client, sa); err == nil {
 		sa.Account = account
+	} else {
+		diagnostic("refresh_profile_failed", sa, err, 0)
 	}
-	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthData(sa)})
+	auth := toAuthData(sa)
+	if req.AuthID != "" {
+		auth.ID = req.AuthID
+	}
+	auth.FileName = "" // The host retains the original file, including legacy workbuddy.json.
+
+	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: auth, NextRefreshAfter: auth.NextRefreshAfter})
 }
 
 // -----------------------------------------------------------------------------
@@ -685,7 +774,7 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 // -----------------------------------------------------------------------------
 
 func handleExecExecute(raw []byte) ([]byte, error) {
-	var req pluginapi.ExecutorRequest
+	var req executorStreamRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
@@ -693,29 +782,24 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// CodeBuddy rejects non-stream requests (code 11101), so always stream
-	// upstream and fold the chunks into a single chat.completion object.
-	body, err := prepareUpstreamPayload(req, sa)
+	body, err := prepareUpstreamPayload(req.ExecutorRequest, sa)
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
+	resp, done, err := openUpstreamChat(body, sa, req.HostCallbackID)
 	if err != nil {
+		diagnostic("chat_failed", sa, err, 0)
 		return nil, err
 	}
-	chatHeaders(httpReq, sa)
-	resp, err := doChatRequest(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("http_error: %w", err)
-	}
+	defer done()
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		payload, _ := io.ReadAll(resp.Body)
-		return nil, &requestError{status: resp.StatusCode, message: fmt.Sprintf("upstream %d: %s", resp.StatusCode, truncate(string(payload), 200))}
-	}
-	completion, err := aggregateCompletion(resp.Body, req.Model)
+	completion, err := aggregateCompletion(resp.Body, req.Model, offeredToolNames(body))
 	if err != nil {
-		return nil, err
+		if cause := resp.Request.Context().Err(); cause != nil {
+			err = cause
+		}
+		diagnostic("chat_failed", sa, err, 0)
+		return nil, &requestError{status: errorStatus(err), message: publicError(err)}
 	}
 	return okEnvelope(pluginapi.ExecutorResponse{Payload: completion})
 }
@@ -741,30 +825,25 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	headers := streamHeaders()
-	sseFramed := clientNeedsSSEFrame(req.Metadata)
-
-	// No async stream id → fall back to synchronous chunk collection.
-	if req.StreamID == "" {
-		chunks, errCollect := collectUpstreamStream(body, sa, sseFramed)
-		if errCollect != nil {
-			return nil, errCollect
-		}
-		return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
-	}
-
-	// Async: return immediately with empty chunks. A goroutine pumps the upstream
-	// and emits each chunk via host.stream.emit so the client sees true streaming.
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
+	// Return HTTP errors before declaring the stream successful so CPA can retry
+	// another credential, refresh, or cool down a rate-limited account.
+	resp, done, err := openUpstreamChat(body, sa, req.HostCallbackID)
 	if err != nil {
-		streamEmitError(req.StreamID, err.Error())
-		streamClose(req.StreamID)
-		return okEnvelope(streamResponse{Headers: headers})
+		diagnostic("stream_open_failed", sa, err, 0)
+		return nil, err
 	}
-	chatHeaders(httpReq, sa)
-	go pumpUpstreamStream(httpReq, req.StreamID, sseFramed)
-	return okEnvelope(streamResponse{Headers: headers})
+	framed := clientNeedsSSEFrame(req.Metadata)
+	if req.StreamID == "" {
+		defer done()
+		defer resp.Body.Close()
+		chunks, err := aggregateSSE(resp.Body, framed)
+		if err != nil {
+			return nil, &requestError{status: errorStatus(err), message: publicError(err)}
+		}
+		return okEnvelope(streamResponse{Headers: streamHeaders(), Chunks: chunks})
+	}
+	go func() { defer done(); pumpUpstreamStream(resp, req.StreamID, framed, sa) }()
+	return okEnvelope(streamResponse{Headers: streamHeaders()})
 }
 
 func streamHeaders() http.Header {
@@ -779,44 +858,38 @@ func streamHeaders() http.Header {
 // emits each cleaned chunk to the host stream. It closes the stream when done.
 // An emit failure (client disconnected → host closed the stream) aborts the
 // pump so we stop reading a dead upstream.
-func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool) {
-	resp, err := doChatRequest(httpReq)
-	if err != nil {
-		streamEmitError(streamID, fmt.Sprintf("http_error: %v", err))
-		streamClose(streamID)
-		return
-	}
+func pumpUpstreamStream(resp *http.Response, streamID string, framed bool, sa *storedAuth) {
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		errPayload, _ := io.ReadAll(resp.Body)
-		streamEmitError(streamID, fmt.Sprintf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200)))
-		streamClose(streamID)
-		return
+	defer streamClose(streamID)
+	// Closing the host stream unblocks a host emit stalled by downstream backpressure.
+	callbackDone := make(chan struct{})
+	stop := context.AfterFunc(resp.Request.Context(), func() { defer close(callbackDone); streamCloseFailure(streamID, resp.Request.Context().Err()) })
+	defer func() {
+		if !stop() {
+			<-callbackDone
+		}
+	}()
+	if err := forwardCompletionStream(resp.Body, framed, func(payload []byte) error { return streamEmit(streamID, payload) }); err != nil {
+		if cause := resp.Request.Context().Err(); cause != nil {
+			err = cause
+		}
+		diagnostic("stream_failed", sa, err, 0)
+		streamEmitFailure(streamID, err)
 	}
-	if err := forwardCompletionStream(resp.Body, sseFramed, func(payload []byte) error { return streamEmit(streamID, payload) }); err != nil {
-		streamEmitError(streamID, err.Error())
-	}
-	streamClose(streamID)
 }
 
-// collectUpstreamStream is the synchronous fallback (no async stream id): drain
-// the upstream, clean each chunk, return them as a slice.
-func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool) ([]pluginapi.ExecutorStreamChunk, error) {
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
+func collectUpstreamStream(body []byte, sa *storedAuth, framed bool) ([]pluginapi.ExecutorStreamChunk, error) {
+	resp, done, err := openUpstreamChat(body, sa, "")
 	if err != nil {
 		return nil, err
 	}
-	chatHeaders(httpReq, sa)
-	resp, err := doChatRequest(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("http_error: %w", err)
-	}
+	defer done()
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		errPayload, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200))
+	chunks, err := aggregateSSE(resp.Body, framed)
+	if err != nil {
+		return nil, &requestError{status: errorStatus(err), message: publicError(err)}
 	}
-	return aggregateSSE(resp.Body, sseFramed)
+	return chunks, nil
 }
 
 // clientNeedsSSEFrame reports whether chunk payloads must carry their own
@@ -871,32 +944,28 @@ func isEmptyValue(v any) bool {
 // rewrite is a single-word change so the prompt's meaning is preserved while
 // dodging the exact-match filter.
 func rewriteSystemForUpstream(payload []byte) []byte {
-	if len(payload) == 0 {
-		return payload
-	}
-	var obj map[string]any
-	if json.Unmarshal(payload, &obj) != nil {
-		return payload
-	}
-	messages, _ := obj["messages"].([]any)
-	changed := false
-	for _, m := range messages {
-		msg, ok := m.(map[string]any)
-		if !ok {
-			continue
-		}
-		if rewriteContentField(msg) {
-			changed = true
-		}
-	}
-	if !changed {
-		return payload
-	}
-	out, err := json.Marshal(obj)
+	obj, err := decodeObject(payload)
 	if err != nil {
 		return payload
 	}
-	return out
+	rewriteSystemMessages(obj)
+	result, err := marshalJSON(obj)
+	if err != nil {
+		return payload
+	}
+	return result
+}
+func rewriteSystemMessages(obj map[string]any) {
+	messages, _ := obj["messages"].([]any)
+	for _, item := range messages {
+		msg, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if msg["role"] == "system" || msg["role"] == "developer" {
+			rewriteContentField(msg)
+		}
+	}
 }
 
 // rewriteContentField sanitizes blocked templates in one message's content,
@@ -940,8 +1009,9 @@ func sanitizeBlockedTemplates(s string) string {
 
 // aggregateCompletion folds an SSE stream into a single non-streaming
 // chat.completion object (used for non-stream client requests).
-func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
-	var content, reasoning, role, respModel, respID, finish string
+func aggregateCompletion(r io.Reader, model string, known ...[]string) ([]byte, error) {
+	var content, reasoning strings.Builder
+	var role, respModel, respID, finish string
 	var created int64
 	var usage map[string]any
 	toolCallsByIndex := map[int]map[string]any{}
@@ -970,15 +1040,15 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 					role = v
 				}
 				if v, ok := delta["content"].(string); ok {
-					content += v
+					content.WriteString(v)
 				}
 				if v, ok := delta["reasoning_content"].(string); ok {
-					reasoning += v
+					reasoning.WriteString(v)
 				}
 				if tcs, ok := delta["tool_calls"].([]any); ok {
 					for index, tc := range tcs {
 						if call, ok := tc.(map[string]any); ok {
-							mergeToolCallDelta(toolCallsByIndex, call, index)
+							mergeToolCallDelta(toolCallsByIndex, call, index, known...)
 						}
 					}
 				}
@@ -993,9 +1063,9 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 		return nil, err
 	}
 	toolCalls := orderedToolCalls(toolCallsByIndex)
-	message := map[string]any{"role": firstNonEmpty(role, "assistant"), "content": content}
-	if reasoning != "" {
-		message["reasoning_content"] = reasoning
+	message := map[string]any{"role": firstNonEmpty(role, "assistant"), "content": content.String()}
+	if reasoning.Len() > 0 {
+		message["reasoning_content"] = reasoning.String()
 	}
 	if len(toolCalls) > 0 {
 		message["tool_calls"] = toolCalls
@@ -1068,7 +1138,13 @@ func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 
 func truncate(s string, n int) string {
 	if len(s) <= n {
-		return s
+		return strings.ToValidUTF8(s, "�")
 	}
-	return s[:n]
+	if n <= 0 {
+		return ""
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return strings.ToValidUTF8(s[:n], "�")
 }

@@ -66,3 +66,45 @@ data: [DONE]
 		t.Fatal("finish reason lost")
 	}
 }
+
+func TestToolNameFragmentsUseOfferedSchema(t *testing.T) {
+	for _, sample := range []struct {
+		parts       []string
+		known, want string
+	}{{[]string{"ab", "ab"}, "ab", "ab"}, {[]string{"ab", "ab"}, "abab", "abab"}, {[]string{"get", "_weather"}, "get_weather", "get_weather"}, {[]string{"get", "get_weather"}, "get_weather", "get_weather"}} {
+		calls := map[int]map[string]any{}
+		for _, part := range sample.parts {
+			mergeToolCallDelta(calls, map[string]any{"function": map[string]any{"name": part}}, 0, []string{sample.known})
+		}
+		if name := orderedToolCalls(calls)[0]["function"].(map[string]any)["name"]; name != sample.want {
+			t.Fatalf("%v -> %v, want %s", sample.parts, name, sample.want)
+		}
+	}
+}
+func BenchmarkTextAggregation(b *testing.B) {
+	part := strings.Repeat("x", 100)
+	b.Run("legacy_concat_1MB_10k_chunks", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			var result string
+			for j := 0; j < 10000; j++ {
+				result += part
+			}
+			if len(result) != 1000000 {
+				b.Fatal("lost output")
+			}
+		}
+	})
+	b.Run("builder_1MB_10k_chunks", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			var result strings.Builder
+			for j := 0; j < 10000; j++ {
+				result.WriteString(part)
+			}
+			if result.Len() != 1000000 {
+				b.Fatal("lost output")
+			}
+		}
+	})
+}

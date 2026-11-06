@@ -143,5 +143,8 @@ systemctl enable --now codebuddy-model-refresh.timer
 ```
 
 systemd 通过 `LoadCredential` 向服务提供密钥，不把密钥放进命令行或日志。
-模板在启动两分钟后首次执行，之后每五分钟执行；CPA 已停止时跳过。
+模板在启动两分钟后首次执行，之后每十五分钟执行；CPA 已停止时跳过。
 可通过 `journalctl -u codebuddy-model-refresh.service` 检查执行结果。
+
+
+v0.4.0 的维护脚本不限制插件版本号，按目录元数据能力判断。缓存仍新鲜时返回 `fresh`，不会强制作废 TTL；需要刷新时才请求重新发现。多账号 `catalog_variants` 会纳入判断，结果中的 `accounts` 来自管理接口的逐凭据模型计数；不可用行返回 `partial` 并单独计数。timer 默认十五分钟，建议不短于 `catalog.ttl-seconds`。仅修改其他插件设置不会强制失效目录。

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -23,7 +24,13 @@ func chatHeaders(req *http.Request, auth *storedAuth) {
 func doChatRequest(req *http.Request) (*http.Response, error) {
 	client := *sharedHTTPClient()
 	client.Timeout = 0
-	response, err := client.Do(req)
+	var response *http.Response
+	var err error
+	if callback, _ := req.Context().Value(hostCallbackKey{}).(string); callback != "" {
+		response, err = doHostChatRequest(req, callback)
+	} else {
+		response, err = client.Do(req)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -78,4 +85,50 @@ func (b *idleStreamBody) Close() error {
 	b.timer.Stop()
 	b.mu.Unlock()
 	return b.body.Close()
+}
+
+// Bound the complete operation as well as read inactivity. The response headers
+// are available synchronously on all three execution paths.
+func openUpstreamChat(body []byte, sa *storedAuth, callback string) (*http.Response, func(), error) {
+	ctx, done, err := startOperation(chatDuration())
+	if err != nil {
+		return nil, nil, err
+	}
+	if callback != "" {
+		ctx = withHostCallback(ctx, callback)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointChat, bytes.NewReader(body))
+	if err != nil {
+		done()
+		return nil, nil, err
+	}
+	chatHeaders(req, sa)
+	resp, err := doChatRequest(req)
+	if err != nil {
+		if cause := ctx.Err(); cause != nil {
+			err = cause
+		}
+		done()
+		return nil, nil, &requestError{status: errorStatus(err), message: publicError(err)}
+	}
+	if resp.Request == nil {
+		resp.Request = req
+	}
+	if err := upstreamStatusError(resp); err != nil {
+		resp.Body.Close()
+		done()
+		return nil, nil, err
+	}
+	return resp, done, nil
+}
+func upstreamStatusError(resp *http.Response) error {
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	// Only headers are needed. Never wait for or echo an untrusted error body.
+	status := resp.StatusCode
+	if status < 400 {
+		status = 502
+	}
+	return &requestError{status: status, message: fmt.Sprintf("WorkBuddy upstream HTTP %d", resp.StatusCode)}
 }

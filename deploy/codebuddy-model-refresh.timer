@@ -1,9 +1,9 @@
 [Unit]
-Description=Keep CodeBuddy model discovery and routes current
+Description=Keep WorkBuddy model discovery and routes current
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=5min
+OnUnitActiveSec=15min
 AccuracySec=10s
 Unit=codebuddy-model-refresh.service
 

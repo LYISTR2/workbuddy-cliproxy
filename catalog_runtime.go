@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,7 +15,11 @@ import (
 )
 
 type catalogConfiguration struct {
-	Catalog struct {
+	Chat struct {
+		MaxDurationSeconds int `yaml:"max-duration-seconds"`
+	} `yaml:"chat"`
+	RefreshNonce int64 `yaml:"_catalog_refresh"`
+	Catalog      struct {
 		Channel         string                  `yaml:"channel"`
 		TTLSeconds      int                     `yaml:"ttl-seconds"`
 		MaxStaleSeconds int                     `yaml:"max-stale-seconds"`
@@ -29,18 +32,23 @@ type catalogRuntimeState struct {
 	snapshots       map[string]catalog.Snapshot
 	options         catalog.Options
 	reasoningPolicy catalog.ReasoningPolicy
+	refreshNonce    int64
 }
 
 var dynamicCatalog = &catalogRuntimeState{snapshots: map[string]catalog.Snapshot{}}
 
 func configureCatalog(raw []byte) error {
 	var request struct {
-		ConfigYAML []byte `json:"config_yaml"`
+		ConfigYAML    []byte `json:"config_yaml"`
+		SchemaVersion uint32 `json:"schema_version"`
 	}
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &request); err != nil {
 			return fmt.Errorf("decode plugin lifecycle request: %w", err)
 		}
+	}
+	if request.SchemaVersion > 0 {
+		hostSchema.Store(request.SchemaVersion)
 	}
 	var settings catalogConfiguration
 	if len(request.ConfigYAML) > 0 {
@@ -67,6 +75,10 @@ func configureCatalog(raw []byte) error {
 	if !policy.Valid() {
 		return fmt.Errorf("catalog.reasoning-effort-policy must be compatible or strict")
 	}
+	if settings.Chat.MaxDurationSeconds < 0 || settings.Chat.MaxDurationSeconds > 7200 {
+		return fmt.Errorf("chat.max-duration-seconds must be between 1 and 7200, or 0 for the default")
+	}
+	chatMaxSeconds.Store(int64(settings.Chat.MaxDurationSeconds))
 	dynamicCatalog.mu.Lock()
 	defer dynamicCatalog.mu.Unlock()
 	if dynamicCatalog.manager == nil {
@@ -75,10 +87,14 @@ func configureCatalog(raw []byte) error {
 		dynamicCatalog.manager = catalog.NewManager(catalog.HTTPFetcher(client, catalog.ConfigURL), options)
 	} else {
 		dynamicCatalog.manager.Reconfigure(options)
+		if settings.RefreshNonce != 0 && settings.RefreshNonce != dynamicCatalog.refreshNonce {
+			dynamicCatalog.manager.Invalidate()
+		}
 	}
 	if dynamicCatalog.options.Channel != "" && dynamicCatalog.options.Channel != options.Channel {
 		dynamicCatalog.snapshots = map[string]catalog.Snapshot{}
 	}
+	dynamicCatalog.refreshNonce = settings.RefreshNonce
 	dynamicCatalog.options = options
 	dynamicCatalog.reasoningPolicy = policy
 	return nil
@@ -89,7 +105,7 @@ func catalogCredentials(sa *storedAuth) catalog.Credentials {
 }
 func accountCatalog(authID string, sa *storedAuth) (catalog.Snapshot, error) {
 	if authID == "" {
-		authID = providerName
+		authID, _ = authIdentity(sa)
 	}
 	dynamicCatalog.mu.RLock()
 	manager := dynamicCatalog.manager
@@ -108,14 +124,18 @@ func accountCatalog(authID string, sa *storedAuth) (catalog.Snapshot, error) {
 		}
 		sa.Account = account
 	}
-	snapshot, err := manager.Get(context.Background(), catalogCredentials(sa))
+	snapshot, err := manager.View(pluginContext(), catalogCredentials(sa))
 	if err != nil {
 		dynamicCatalog.mu.Lock()
+		diagnostic("catalog_failed", sa, err, 0)
 		delete(dynamicCatalog.snapshots, authID)
 		dynamicCatalog.mu.Unlock()
 		return catalog.Snapshot{}, err
 	}
 	dynamicCatalog.mu.Lock()
+	if snapshot.Stale {
+		diagnostic("catalog_stale", sa, nil, 0)
+	}
 	dynamicCatalog.snapshots[authID] = snapshot
 	dynamicCatalog.mu.Unlock()
 	return snapshot, nil
@@ -181,8 +201,8 @@ func prepareUpstreamPayload(req pluginapi.ExecutorRequest, sa *storedAuth) ([]by
 	if len(source) == 0 {
 		source = req.OriginalRequest
 	}
-	var body map[string]any
-	if err = json.Unmarshal(source, &body); err != nil || body == nil {
+	body, err := decodeObject(source)
+	if err != nil {
 		return nil, &requestError{status: 400, message: "invalid chat completion request body"}
 	}
 	// The host has already resolved aliases; preserve this native model ID.
@@ -197,11 +217,12 @@ func prepareUpstreamPayload(req pluginapi.ExecutorRequest, sa *storedAuth) ([]by
 	if err = model.ApplyReasoningWithPolicy(body, policy); err != nil {
 		return nil, &requestError{status: 400, message: err.Error()}
 	}
-	result, err := json.Marshal(body)
+	rewriteSystemMessages(body)
+	result, err := marshalJSON(body)
 	if err != nil {
 		return nil, err
 	}
-	return rewriteSystemForUpstream(result), nil
+	return result, nil
 }
 
 type catalogInterceptResponse = pluginapi.ResponseInterceptResponse
