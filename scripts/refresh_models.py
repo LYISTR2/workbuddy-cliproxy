@@ -44,7 +44,7 @@ def main():
     if not plugin or not plugin.get("effective_enabled"):
         print(json.dumps({"status": "skipped", "reason": "plugin_disabled"}))
         return 0
-    if plugin.get("metadata", {}).get("version") not in {"0.2.0-catalog", "0.3.0", "0.3.1"}:
+    if plugin.get("metadata", {}).get("version") not in {"0.2.0-catalog", "0.3.0", "0.3.1", "0.3.2"}:
         raise RuntimeError("dynamic_catalog_plugin_not_active")
     before = call("/v1/models", "api_key")
     previous = {m.get("id"): m.get("catalog", {}).get("fetched_at")

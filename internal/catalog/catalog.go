@@ -14,9 +14,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/lovingfish/workbuddy-cliproxy/internal/workbuddy"
 )
 
-const ConfigURL = "https://www.workbuddy.cn/v3/config"
+const ConfigURL = workbuddy.BaseURL + "/v3/config"
 
 type Credentials struct{ AccessToken, UID, EnterpriseID, Domain string }
 type Options struct {
@@ -54,9 +56,23 @@ type Snapshot struct {
 	FreshUntil time.Time
 	Stale      bool
 }
-type HTTPError struct{ Status int }
+type HTTPError struct{ Status, Code int }
 
-func (e *HTTPError) Error() string { return fmt.Sprintf("catalog HTTP %d", e.Status) }
+func (e *HTTPError) Error() string {
+	if e.Code != 0 {
+		return fmt.Sprintf("catalog HTTP %d: %s", e.Status, (&BusinessError{Code: e.Code}).Error())
+	}
+	return fmt.Sprintf("catalog HTTP %d", e.Status)
+}
+
+type BusinessError struct{ Code int }
+
+func (e *BusinessError) Error() string {
+	if e.Code == 12403 {
+		return "catalog upstream code 12403: WorkBuddy client version was rejected"
+	}
+	return fmt.Sprintf("catalog upstream code %d", e.Code)
+}
 
 type Fetcher func(context.Context, Credentials) ([]byte, error)
 type cacheEntry struct {
@@ -153,21 +169,16 @@ func (m *Manager) Get(ctx context.Context, c Credentials) (Snapshot, error) {
 	}
 	return Snapshot{}, err
 }
-func HTTPFetcher(client *http.Client, endpoint, userAgent string) Fetcher {
+func HTTPFetcher(client *http.Client, endpoint string) Fetcher {
 	return func(ctx context.Context, c Credentials) ([]byte, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return nil, fmt.Errorf("create catalog request: %w", err)
 		}
+		workbuddy.SetClientHeaders(req)
 		req.Header.Set("Authorization", "Bearer "+c.AccessToken)
 		req.Header.Set("X-User-Id", c.UID)
-		req.Header.Set("X-Product", "SaaS")
-		req.Header.Set("X-Product-Code", "workbuddy")
-		req.Header.Set("User-Agent", userAgent)
 		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Origin", "https://www.workbuddy.cn")
-		req.Header.Set("Referer", "https://www.workbuddy.cn/")
-		req.Header.Set("X-Requested-With", "XMLHttpRequest")
 		if c.EnterpriseID != "" {
 			req.Header.Set("X-Enterprise-Id", c.EnterpriseID)
 		} else {
@@ -183,15 +194,19 @@ func HTTPFetcher(client *http.Client, endpoint, userAgent string) Fetcher {
 			return nil, fmt.Errorf("fetch catalog: %w", err)
 		}
 		defer response.Body.Close()
-		if response.StatusCode != http.StatusOK {
-			return nil, &HTTPError{Status: response.StatusCode}
-		}
 		raw, err := io.ReadAll(io.LimitReader(response.Body, 8*1024*1024+1))
 		if err != nil {
 			return nil, fmt.Errorf("read catalog: %w", err)
 		}
 		if len(raw) > 8*1024*1024 {
 			return nil, fmt.Errorf("catalog exceeds response size limit")
+		}
+		if response.StatusCode != http.StatusOK {
+			var failure struct {
+				Code int `json:"code"`
+			}
+			_ = json.Unmarshal(raw, &failure)
+			return nil, &HTTPError{Status: response.StatusCode, Code: failure.Code}
 		}
 		return raw, nil
 	}
@@ -219,7 +234,13 @@ func Parse(raw []byte, channel string, now time.Time) (Snapshot, error) {
 		if envelope.Code != nil && (*envelope.Code == 401 || *envelope.Code == 403) {
 			return Snapshot{}, &HTTPError{Status: *envelope.Code}
 		}
-		return Snapshot{}, fmt.Errorf("catalog business response was not successful")
+		if envelope.Code != nil {
+			return Snapshot{}, &BusinessError{Code: *envelope.Code}
+		}
+		return Snapshot{}, fmt.Errorf("catalog response has no business status code")
+	}
+	if envelope.Data.Models == nil {
+		return Snapshot{}, fmt.Errorf("catalog response omitted model definitions; check account authorization or upstream schema")
 	}
 	var allowed []string
 	found := false

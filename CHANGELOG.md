@@ -1,5 +1,17 @@
 # 更新记录
 
+## 0.3.2 — 2026-11-06
+
+- 修复 v0.3.1 的 `WorkBuddy/CLIProxyAPI` 无数字版本标识：模型网关不能据此解析客户端版本，会以 `12403` 拒绝目录请求。
+- 登录、目录和推理共用带数字版本的 WorkBuddy 客户端配置，统一 `X-IDE-Name`、`X-IDE-Type`、`X-IDE-Version` 和国内站 `X-Domain`，防止不同请求路径再次漂移。登录仍为 WorkBuddy 国内版 `platform=workbuddy`。
+- 为旧凭据缺失用户 ID 的情况读取账号资料，再继续发现模型；已有有效凭据无需因为升级而直接删除。
+- HTTP 错误及业务错误保留上游数字状态码，为 `12403` 提供版本校验提示；上游未返回模型定义时明确报错，不伪装成成功的空目录。
+- 增加版本校验网关、错误码保留、账号资料恢复及发现后对话的回归测试。
+
+验证：30 项测试含竞态检查通过。使用 CPA v8.0.56 和只处理合成凭据的本地 TLS 模拟网关，旧 v0.3.1 构建复现 `12403` 与零模型；新构建在正常凭据及缺失 UID 的旧凭据两种情况下，均通过 `/v1/models`、`/v0/management/auth-files/models?name=workbuddy.json` 和一次非流式对话验证。没有连接用户实际的 CPA 账号，不能据此确认真实账号当前权限、额度或上游目录。
+
+协议问题参考：[WorkBuddy 模型发现客户端版本校验](https://github.com/cheaper-inference/OmniRoute/issues/17991)；客户端标识格式参考 [WorkBuddy 桌面端请求取证](https://github.com/dingminhua/dsh-connect-workbuddy/blob/main/docs/PROMO_BADGE.md)。
+
 ## 0.3.1 — 2026-11-06
 
 - 默认授权服务改为 WorkBuddy 国内站 `www.workbuddy.cn`，使用 `platform=workbuddy`，直接打开官方返回的 WorkBuddy 网页；不再使用 CodeBuddy CLI 登录入口。

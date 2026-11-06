@@ -63,7 +63,7 @@ func configureCatalog(raw []byte) error {
 	if dynamicCatalog.manager == nil {
 		client := &http.Client{Timeout: 20 * time.Second, Transport: sharedHTTPClient().Transport,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-		dynamicCatalog.manager = catalog.NewManager(catalog.HTTPFetcher(client, catalog.ConfigURL, clientUA), options)
+		dynamicCatalog.manager = catalog.NewManager(catalog.HTTPFetcher(client, catalog.ConfigURL), options)
 	} else {
 		dynamicCatalog.manager.Reconfigure(options)
 	}
@@ -86,6 +86,17 @@ func accountCatalog(authID string, sa *storedAuth) (catalog.Snapshot, error) {
 	dynamicCatalog.mu.RUnlock()
 	if manager == nil {
 		return catalog.Snapshot{}, fmt.Errorf("catalog is not initialized")
+	}
+	// Earlier plugin versions could persist the token before account lookup
+	// completed. Recover that profile instead of rejecting an otherwise valid token.
+	if strings.TrimSpace(sa.Account.UID) == "" {
+		client := &http.Client{Timeout: 10 * time.Second, Transport: sharedHTTPClient().Transport,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+		account, err := fetchWorkbuddyAccount(client, sa)
+		if err != nil {
+			return catalog.Snapshot{}, fmt.Errorf("recover WorkBuddy account details: %w", err)
+		}
+		sa.Account = account
 	}
 	snapshot, err := manager.Get(context.Background(), catalogCredentials(sa))
 	if err != nil {

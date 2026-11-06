@@ -182,7 +182,7 @@ func TestHTTPFetcherUsesCurrentAccountHeaders(t *testing.T) {
 		_, _ = w.Write([]byte(fixture))
 	}))
 	defer server.Close()
-	fetch := HTTPFetcher(server.Client(), server.URL, "CLI/test")
+	fetch := HTTPFetcher(server.Client(), server.URL)
 	raw, err := fetch(context.Background(), Credentials{AccessToken: "test-token", UID: "test-user", EnterpriseID: "test-enterprise"})
 	if err != nil || string(raw) != fixture {
 		t.Fatal(err)

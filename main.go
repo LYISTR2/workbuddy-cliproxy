@@ -73,16 +73,16 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/lovingfish/workbuddy-cliproxy/internal/workbuddy"
+
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 const (
-	providerName  = "workbuddy"
-	authFileName  = "workbuddy.json"
-	upstreamBase  = "https://www.workbuddy.cn"
-	clientUA      = "WorkBuddy/CLIProxyAPI"
-	originReferer = upstreamBase
+	providerName = "workbuddy"
+	authFileName = "workbuddy.json"
+	upstreamBase = workbuddy.BaseURL
 
 	endpointAuthState    = upstreamBase + "/v2/plugin/auth/state?platform=workbuddy"
 	endpointAccount      = upstreamBase + "/v2/plugin/account"
@@ -315,7 +315,7 @@ func wbRegistration() registration {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             providerName,
-			Version:          "0.3.1",
+			Version:          "0.3.2",
 			Author:           "lovingfish (clean-room rebuild; original workbuddy by Sliverkiss)",
 			GitHubRepository: "https://github.com/LYISTR2/workbuddy-cliproxy",
 		},
@@ -427,14 +427,7 @@ func newLoginClient() *http.Client {
 }
 
 func commonHeaders(req *http.Request) {
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Origin", originReferer)
-	req.Header.Set("Referer", originReferer+"/")
-	req.Header.Set("User-Agent", clientUA)
-	req.Header.Set("X-Product", "SaaS")
-	req.Header.Set("X-Product-Code", providerName)
+	workbuddy.SetClientHeaders(req)
 }
 
 // backendHeaders applies auth-derived headers to a chat completion request.
