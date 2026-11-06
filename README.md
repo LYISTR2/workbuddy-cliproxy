@@ -1,6 +1,6 @@
 # workbuddy-cliproxy
 
-本 fork 的 **v0.3.3** 使用 WorkBuddy 国内版官方网页授权（`platform=workbuddy`）和账号的实时模型目录，适配 CPA v8.0.56。更新说明见 [CHANGELOG](CHANGELOG.md)。模型由上游返回，后续新增模型无需逐个修改源码；模型重新注册的刷新方式见 [动态模型目录](docs/dynamic-models.md#定期刷新)。
+本 fork 的 **v0.3.4** 使用 WorkBuddy 国内版官方网页授权（`platform=workbuddy`）和账号的实时模型目录，适配 CPA v8.0.56。更新说明见 [CHANGELOG](CHANGELOG.md)。模型由上游返回，后续新增模型无需逐个修改源码；模型重新注册的刷新方式见 [动态模型目录](docs/dynamic-models.md#定期刷新)。
 
 把**腾讯 WorkBuddy 国内版**（`www.workbuddy.cn`）封装成 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)(CPA)插件,任何支持 OpenAI / Anthropic 协议的客户端(Claude Code、Cursor、Cline、SDK……)都能直接调用 WorkBuddy 背后的模型。
 
@@ -24,7 +24,7 @@
 
 v0.3.1 的客户端标识缺少可解析的版本号，会导致模型目录被网关以 `12403` 拒绝。v0.3.2 使用统一的 WorkBuddy 版本标识、IDE 名称/类型/版本和域信息，并兼容旧凭据缺少用户 ID 的情况。
 
-升级时先保留现有账号文件，替换对应架构的 `workbuddy.so` 并重启 CPA；确认插件版本显示 `0.3.3`，再查看该凭据支持的模型。目录按账号重新发现，不用手写模型名单。若凭据本身已经失效，仍需要重新进行 WorkBuddy 授权。
+升级时先保留现有账号文件，替换对应架构的 `workbuddy.so` 并重启 CPA；确认插件版本显示 `0.3.4`，再查看该凭据支持的模型。目录按账号重新发现，不用手写模型名单。若凭据本身已经失效，仍需要重新进行 WorkBuddy 授权。
 
 目录失败时，CPA 日志会保留上游数字错误码；`12403` 指向客户端版本校验，HTTP `401/403` 指向账号鉴权。
 
@@ -122,7 +122,13 @@ catalog:
 
 ## 流式
 
-真流式(async):转发上游时边读边通过 `host.stream.emit` 把每个 chunk 实时推给 CPA,客户端逐字收到(不是等收齐了一股脑)。hy3 几千字的思考过程也是实时流出的,不是憋半天再刷出来。
+转发上游时按完整 SSE 事件读取，并通过 `host.stream.emit` 实时推给 CPA。`: heartbeat` 等注释、`event/id/retry` 控制字段不会被当作模型 JSON 转发；多行 `data:`、BOM、LF/CRLF/CR 行尾均受支持。
+
+v0.3.4 修复旧版把心跳误传为数据、空字符串 `finish_reason` 及读流错误被忽略的问题。空的结束原因规范化为 `null`；坏 JSON、上游错误和未完成的断流会明确上报，思考、正文、工具参数和 usage 数据继续保留。
+
+聊天请求使用 `Accept: text/event-stream`。响应头等待上限为 60 秒，读取空闲上限为 180 秒；收到字节（包括上游心跳）后重置空闲计时。对话不再受到通用 HTTP 客户端 120 秒总时限的截断；登录和目录请求保留各自的超时。
+
+使用 CPA v7.3.10 / v8.0.56、本地模拟上游和 OpenAI Python SDK 3.46.0 的严格响应校验，验证了带心跳的流式、非流式及工具调用。模拟验证不代表已验证你的真实账号或 Hermes 的全部运行配置。
 
 ## 测试与定期刷新
 

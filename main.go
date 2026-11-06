@@ -58,13 +58,13 @@ extern void cliproxyPluginShutdown(void);
 import "C"
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -219,8 +219,8 @@ func streamEmitError(streamID, message string) {
 	if streamID == "" {
 		return
 	}
-	errJSON, _ := json.Marshal(map[string]any{"error": map[string]any{"message": message}})
-	_ = streamEmit(streamID, errJSON)
+	body, _ := json.Marshal(map[string]any{"stream_id": streamID, "error": message})
+	_, _ = hostCall(pluginabi.MethodHostStreamEmit, body)
 }
 
 func streamClose(streamID string) {
@@ -315,7 +315,7 @@ func wbRegistration() registration {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             providerName,
-			Version:          "0.3.3",
+			Version:          "0.3.4",
 			Author:           "lovingfish (clean-room rebuild; original workbuddy by Sliverkiss)",
 			GitHubRepository: "https://github.com/LYISTR2/workbuddy-cliproxy",
 		},
@@ -404,10 +404,13 @@ func sharedHTTPClient() *http.Client {
 		sharedClient = &http.Client{
 			Timeout: 120 * time.Second,
 			Transport: &http.Transport{
-				Proxy:               http.ProxyFromEnvironment,
-				MaxIdleConns:        20,
-				IdleConnTimeout:     90 * time.Second,
-				MaxIdleConnsPerHost: 5,
+				Proxy:                 http.ProxyFromEnvironment,
+				DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 60 * time.Second,
+				MaxIdleConns:          20,
+				IdleConnTimeout:       90 * time.Second,
+				MaxIdleConnsPerHost:   5,
 			},
 			Jar: jar,
 		}
@@ -700,8 +703,8 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	backendHeaders(httpReq, sa)
-	resp, err := sharedHTTPClient().Do(httpReq)
+	chatHeaders(httpReq, sa)
+	resp, err := doChatRequest(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("http_error: %w", err)
 	}
@@ -759,7 +762,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		streamClose(req.StreamID)
 		return okEnvelope(streamResponse{Headers: headers})
 	}
-	backendHeaders(httpReq, sa)
+	chatHeaders(httpReq, sa)
 	go pumpUpstreamStream(httpReq, req.StreamID, sseFramed)
 	return okEnvelope(streamResponse{Headers: headers})
 }
@@ -777,7 +780,7 @@ func streamHeaders() http.Header {
 // An emit failure (client disconnected → host closed the stream) aborts the
 // pump so we stop reading a dead upstream.
 func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool) {
-	resp, err := sharedHTTPClient().Do(httpReq)
+	resp, err := doChatRequest(httpReq)
 	if err != nil {
 		streamEmitError(streamID, fmt.Sprintf("http_error: %v", err))
 		streamClose(streamID)
@@ -790,23 +793,8 @@ func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool) 
 		streamClose(streamID)
 		return
 	}
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
-		content := stripDataPrefix(scanner.Text())
-		if content == "" || content == "[DONE]" {
-			continue
-		}
-		cleaned := cleanChunkJSON(content)
-		if cleaned == "" {
-			continue
-		}
-		if sseFramed {
-			cleaned = "data: " + cleaned
-		}
-		if err := streamEmit(streamID, []byte(cleaned)); err != nil {
-			break
-		}
+	if err := forwardCompletionStream(resp.Body, sseFramed, func(payload []byte) error { return streamEmit(streamID, payload) }); err != nil {
+		streamEmitError(streamID, err.Error())
 	}
 	streamClose(streamID)
 }
@@ -818,8 +806,8 @@ func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool) ([]plugi
 	if err != nil {
 		return nil, err
 	}
-	backendHeaders(httpReq, sa)
-	resp, err := sharedHTTPClient().Do(httpReq)
+	chatHeaders(httpReq, sa)
+	resp, err := doChatRequest(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("http_error: %w", err)
 	}
@@ -828,7 +816,7 @@ func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool) ([]plugi
 		errPayload, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200))
 	}
-	return aggregateSSE(resp.Body, sseFramed), nil
+	return aggregateSSE(resp.Body, sseFramed)
 }
 
 // clientNeedsSSEFrame reports whether chunk payloads must carry their own
@@ -853,54 +841,13 @@ func clientNeedsSSEFrame(metadata map[string]any) bool {
 // payload is emitted as a "data: " line for cross-format translators; otherwise
 // the payload is the raw JSON object and the host chat-completions writer adds
 // the framing itself.
-func aggregateSSE(r io.Reader, sseFramed bool) []pluginapi.ExecutorStreamChunk {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+func aggregateSSE(r io.Reader, sseFramed bool) ([]pluginapi.ExecutorStreamChunk, error) {
 	var chunks []pluginapi.ExecutorStreamChunk
-	for scanner.Scan() {
-		content := stripDataPrefix(scanner.Text())
-		if content == "" || content == "[DONE]" {
-			continue
-		}
-		cleaned := cleanChunkJSON(content)
-		if cleaned == "" {
-			continue
-		}
-		if sseFramed {
-			cleaned = "data: " + cleaned
-		}
-		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: []byte(cleaned)})
-	}
-	return chunks
-}
-
-// cleanChunkJSON strips empty-valued fields (null/""/[]/{}) from choice deltas
-// so strict clients don't trip on {"function_call":null,"tool_calls":[]}.
-func cleanChunkJSON(s string) string {
-	var obj map[string]any
-	if json.Unmarshal([]byte(s), &obj) != nil {
-		return s
-	}
-	if choices, ok := obj["choices"].([]any); ok {
-		for _, c := range choices {
-			choice, ok := c.(map[string]any)
-			if !ok {
-				continue
-			}
-			if delta, ok := choice["delta"].(map[string]any); ok {
-				for k, v := range delta {
-					if isEmptyValue(v) {
-						delete(delta, k)
-					}
-				}
-			}
-		}
-	}
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return s
-	}
-	return string(out)
+	err := forwardCompletionStream(r, sseFramed, func(payload []byte) error {
+		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: payload})
+		return nil
+	})
+	return chunks, err
 }
 
 func isEmptyValue(v any) bool {
@@ -998,22 +945,8 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 	var created int64
 	var usage map[string]any
 	toolCallsByIndex := map[int]map[string]any{}
-	sawChoice := false
 
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
-		data := stripDataPrefix(scanner.Text())
-		if data == "" || data == "[DONE]" {
-			continue
-		}
-		var chunk map[string]any
-		if json.Unmarshal([]byte(data), &chunk) != nil {
-			continue
-		}
-		if upstreamError, present := chunk["error"]; present && upstreamError != nil {
-			return nil, &requestError{status: http.StatusBadGateway, message: "WorkBuddy returned an error in the upstream stream"}
-		}
+	err := readCompletionEvents(r, func(chunk map[string]any) error {
 		if v, ok := chunk["id"].(string); ok && v != "" {
 			respID = v
 		}
@@ -1032,7 +965,6 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 			if choice == nil {
 				continue
 			}
-			sawChoice = true
 			if delta, ok := choice["delta"].(map[string]any); ok {
 				if v, ok := delta["role"].(string); ok && v != "" {
 					role = v
@@ -1055,13 +987,10 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 				finish = v
 			}
 		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read upstream stream: %w", err)
-	}
-	if !sawChoice {
-		return nil, &requestError{status: http.StatusBadGateway, message: "WorkBuddy returned no completion choices"}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	toolCalls := orderedToolCalls(toolCallsByIndex)
 	message := map[string]any{"role": firstNonEmpty(role, "assistant"), "content": content}
@@ -1102,14 +1031,6 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
-}
-
-func stripDataPrefix(s string) string {
-	s = strings.TrimSpace(s)
-	for strings.HasPrefix(s, "data:") {
-		s = strings.TrimSpace(strings.TrimPrefix(s, "data:"))
-	}
-	return s
 }
 
 // -----------------------------------------------------------------------------
